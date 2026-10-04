@@ -161,18 +161,6 @@ export function subagentResultForRun(
   readonly messageId: OrchestrationV2ConversationMessage["id"] | null;
   readonly turnItemId: OrchestrationV2TurnItem["id"] | null;
 } {
-  const message =
-    projection.messages
-      .filter(
-        (candidate) =>
-          candidate.runId === run.id &&
-          candidate.role === "assistant" &&
-          candidate.text.trim().length > 0,
-      )
-      .toSorted(
-        (left, right) =>
-          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-      )[0] ?? null;
   const turnItem =
     projection.turnItems
       .filter(
@@ -184,6 +172,19 @@ export function subagentResultForRun(
           candidate.text.trim().length > 0,
       )
       .toSorted((left, right) => right.ordinal - left.ordinal)[0] ?? null;
+  const message =
+    projection.messages
+      .filter(
+        (candidate) =>
+          candidate.runId === run.id &&
+          (turnItem === null || candidate.id === turnItem.messageId) &&
+          candidate.role === "assistant" &&
+          candidate.text.trim().length > 0,
+      )
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+      )[0] ?? null;
   const failure =
     run.status === "failed"
       ? projection.turnItems

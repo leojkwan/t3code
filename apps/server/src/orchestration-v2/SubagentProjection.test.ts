@@ -298,11 +298,121 @@ it("exposes the provider failure rather than a progress message from the failed 
     {
       ...projection,
       messages: [{ ...artifacts.message, runId: run.id }],
-      turnItems: [{ ...artifacts.turnItem, type: "error", runId: run.id, failure }],
+      turnItems: [
+        { ...artifacts.turnItem, id: TurnItemId.make("progress-item"), runId: run.id },
+        { ...artifacts.turnItem, type: "error", runId: run.id, ordinal: 2, failure },
+        {
+          ...artifacts.turnItem,
+          id: TurnItemId.make("other-run-error"),
+          type: "error",
+          runId: RunId.make("other-run"),
+          ordinal: 3,
+          failure: { ...failure, message: "Another run failed." },
+        },
+      ],
     },
     failedRun,
   );
   assert.equal(result.text, failure.message);
   assert.equal(result.turnItemId, artifacts.turnItem.id);
   assert.isNull(result.messageId);
+});
+
+it("keeps a child result paired with its last assistant item after an earlier message is refreshed", () => {
+  const { projection, run } = taskFixture();
+  const common = {
+    threadId: parentThreadId,
+    rootNodeId: NodeId.make("root"),
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    role: "assistant" as const,
+  };
+  const earlier = makeSubagentConversationArtifacts({
+    ...common,
+    messageId: MessageId.make("earlier-answer"),
+    turnItemId: TurnItemId.make("earlier-answer"),
+    text: "EARLIER ".repeat(3000).slice(0, 22073),
+    ordinal: 27,
+    now: DateTime.makeUnsafe("2026-10-03T10:27:49.504Z"),
+  });
+  const completed = makeSubagentConversationArtifacts({
+    ...common,
+    messageId: MessageId.make("completed-answer"),
+    turnItemId: TurnItemId.make("completed-answer"),
+    text: "COMPLETE ".repeat(4000).slice(0, 34141),
+    ordinal: 29,
+    now: DateTime.makeUnsafe("2026-10-03T10:32:31.433Z"),
+  });
+  if (completed.turnItem.type !== "assistant_message") throw new Error("Expected assistant item");
+  const refreshedEarlier = {
+    ...earlier.message,
+    runId: run.id,
+    updatedAt: DateTime.makeUnsafe("2026-10-03T10:36:36.451Z"),
+  };
+  const completedMessage = {
+    ...completed.message,
+    runId: run.id,
+    updatedAt: DateTime.makeUnsafe("2026-10-03T10:36:36.403Z"),
+  };
+  for (const messages of [[refreshedEarlier, completedMessage], [refreshedEarlier]]) {
+    for (const status of ["completed", "interrupted"] as const) {
+      const result = subagentResultForRun(
+        {
+          ...projection,
+          messages,
+          turnItems: [
+            { ...earlier.turnItem, runId: run.id },
+            {
+              ...completed.turnItem,
+              runId: run.id,
+              status,
+              streaming: status === "interrupted",
+              completedAt: status === "interrupted" ? null : completed.turnItem.completedAt,
+            },
+          ],
+        },
+        { ...run, status },
+      );
+      assert.equal(result.messageId, completed.message.id);
+      assert.equal(result.turnItemId, completed.turnItem.id);
+      assert.equal(result.text, completed.message.text);
+      assert.equal(result.text.length, 34141);
+    }
+  }
+});
+
+it("does not borrow another run's result when a terminal run has no assistant output", () => {
+  const { projection, run } = taskFixture();
+  const earlier = makeSubagentConversationArtifacts({
+    messageId: MessageId.make("previous-run-answer"),
+    turnItemId: TurnItemId.make("previous-run-answer"),
+    threadId: parentThreadId,
+    rootNodeId: NodeId.make("root"),
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    role: "assistant",
+    text: "The previous run completed successfully.",
+    ordinal: 100,
+    now: childCreatedAt,
+  });
+  for (const status of ["completed", "interrupted", "failed", "cancelled"] as const) {
+    const result = subagentResultForRun(
+      {
+        ...projection,
+        messages: [{ ...earlier.message, runId: RunId.make("previous") }],
+        turnItems: [{ ...earlier.turnItem, runId: RunId.make("previous") }],
+      },
+      { ...run, status },
+    );
+    assert.deepEqual(result, {
+      text:
+        status === "completed"
+          ? "Child task completed without an assistant result."
+          : `Child task ended with status ${status}.`,
+      messageId: null,
+      turnItemId: null,
+    });
+  }
 });
