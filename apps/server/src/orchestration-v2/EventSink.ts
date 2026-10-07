@@ -67,6 +67,20 @@ export class EventSinkStreamError extends Schema.TaggedError<EventSinkStreamErro
 export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStreamError]);
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
+/** Internal domain check executed in the native command transaction, before any message or effect commits. */
+export interface CommandCommitCheckValue {
+  readonly commandId: CommandId;
+  readonly threadId: ThreadId;
+  readonly replay: Effect.Effect<void, EventSinkWriteError>;
+  readonly beforeCommit: (
+    events: ReadonlyArray<OrchestrationV2DomainEvent>,
+  ) => Effect.Effect<void, EventSinkWriteError>;
+}
+export const CommandCommitCheck = Context.Reference<CommandCommitCheckValue | undefined>(
+  "t3/orchestration-v2/CommandCommitCheck",
+  { defaultValue: () => undefined },
+);
+
 /**
  * SERVICE DEFINITION
  */
@@ -529,6 +543,10 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          const check = yield* CommandCommitCheck;
+          if (check?.commandId === input.commandId && check.threadId === input.threadId) {
+            yield* check.beforeCommit(input.events);
+          }
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,

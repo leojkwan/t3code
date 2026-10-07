@@ -83,7 +83,7 @@ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "./Notification.ts";
 import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
-import { EventSinkV2 } from "./EventSink.ts";
+import { CommandCommitCheck, EventSinkV2 } from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
@@ -10435,6 +10435,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           receiptThreadId: receipt.threadId,
           commandThreadId: dispatchThreadId,
         });
+      }
+      const check = yield* CommandCommitCheck;
+      if (check?.commandId === command.commandId && check.threadId === dispatchThreadId) {
+        yield* check.replay.pipe(mapDispatchError(command));
       }
       const storedEvents = yield* eventSink.readByCommandId({ commandId: command.commandId }).pipe(
         Stream.runCollect,

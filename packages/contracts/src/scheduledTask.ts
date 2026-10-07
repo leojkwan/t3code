@@ -4,6 +4,7 @@ import {
   CommandId,
   ForwardCompatibleArray,
   IsoDateTime,
+  MessageId,
   ProjectId,
   ScheduledTaskId,
   SecretRef,
@@ -68,6 +69,34 @@ const ScheduledTaskWebhookSignatureFields = {
   }),
 };
 
+const FeedbackReference = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const FeedbackTimestamp = FeedbackReference.check(Schema.isPattern(/^\d+\.\d{6}$/));
+
+/** Native custody for a signed evidence delivery; the request cannot choose a target or actor. */
+const ScheduledTaskAgentFeedbackPolicy = Schema.Struct({
+  type: Schema.Literal("agent_feedback"),
+  ownerThreadId: ThreadId,
+  humanMessageId: MessageId,
+  channelId: FeedbackReference,
+  threadTs: FeedbackTimestamp,
+  humanRequestTs: FeedbackTimestamp,
+  peers: Schema.Array(FeedbackReference).check(Schema.isMinLength(1), Schema.isMaxLength(2)),
+});
+
+/** Lower-authority peer evidence, checked over the exact signed request body. */
+export const ScheduledTaskAgentFeedback = Schema.Struct({
+  eventId: FeedbackReference,
+  channelId: FeedbackReference,
+  threadTs: FeedbackTimestamp,
+  humanRequestTs: FeedbackTimestamp,
+  solicitationTs: FeedbackTimestamp,
+  peerId: FeedbackReference,
+  artifact: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
+  origin: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(32_000)),
+});
+export type ScheduledTaskAgentFeedback = typeof ScheduledTaskAgentFeedback.Type;
+
 /** HMAC-SHA256 over the raw request body. The secret is never part of the read model. */
 export const ScheduledTaskWebhookSignature = Schema.Struct(
   ScheduledTaskWebhookSignatureFields,
@@ -91,6 +120,7 @@ const ScheduledTaskWebhookSchedule = Schema.Struct({
   signature: Schema.NullOr(ScheduledTaskWebhookSignature),
   // Optional so rows saved before this setting existed still decode.
   maxDeliveryAgeMinutes: Schema.optional(Schema.NullOr(WebhookMaxDeliveryAgeMinutes)),
+  deliveryPolicy: Schema.optional(ScheduledTaskAgentFeedbackPolicy),
 }).annotate({
   description:
     "Run on each request to the task's webhook URL. The prompt may use {{body.path}}, {{headers.name}}, {{query.name}}, {{body}} and {{request}} placeholders.",
@@ -117,6 +147,7 @@ const ScheduledTaskUpsertWebhookSchedule = Schema.Struct({
     description: "Signature check; omit or null to accept requests by URL token only.",
   }),
   maxDeliveryAgeMinutes: Schema.optional(Schema.NullOr(WebhookMaxDeliveryAgeMinutes)),
+  deliveryPolicy: Schema.optional(ScheduledTaskAgentFeedbackPolicy),
 }).annotate({
   description:
     "Run on each request to the task's webhook URL. The prompt may use {{body.path}}, {{headers.name}}, {{query.name}}, {{body}} and {{request}} placeholders.",

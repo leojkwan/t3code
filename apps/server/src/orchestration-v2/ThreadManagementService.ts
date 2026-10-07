@@ -35,6 +35,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as Orchestrator from "./Orchestrator.ts";
+import * as EventSink from "./EventSink.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 
@@ -112,6 +113,7 @@ export interface ThreadManagementSendInput {
   readonly mode: ThreadManagementSendMode;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
+  readonly commitCheck?: EventSink.CommandCommitCheckValue;
 }
 
 export interface ThreadManagementSendResult {
@@ -575,20 +577,24 @@ const make = Effect.gen(function* () {
         };
       }
 
-      const dispatch = yield* orchestrator.dispatch({
-        type: "message.dispatch",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        messageId: input.messageId,
-        ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
-        ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
-        text: input.text,
-        attachments: input.attachments,
-        ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-        dispatchMode,
-        createdBy: input.createdBy,
-        creationSource: input.creationSource,
-      });
+      const dispatch = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          messageId: input.messageId,
+          ...(input.scheduledTaskId === undefined
+            ? {}
+            : { scheduledTaskId: input.scheduledTaskId }),
+          ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
+          text: input.text,
+          attachments: input.attachments,
+          ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+          dispatchMode,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        })
+        .pipe(Effect.provideService(EventSink.CommandCommitCheck, input.commitCheck));
       const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
         messageIds: [input.messageId],
         turnItemTypes: ["user_message"],
