@@ -13,6 +13,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RuntimeRequestId,
   ScheduledTaskUpsertInput,
   SecretRequestError,
   ThreadId,
@@ -100,6 +101,7 @@ const withNativeFeedback = <A, E, R>(
   }) => Effect.Effect<A, E, R>,
   options: {
     startHuman?: boolean;
+    ownerCreatedBy?: "user" | "agent";
     existingOwner?: boolean;
     databasePath?: string;
     beforeSend?: Effect.Effect<void>;
@@ -279,7 +281,7 @@ const withNativeFeedback = <A, E, R>(
           threadId: feedbackOwner,
           projectId: feedbackProject,
           title: "Product owner",
-          createdBy: "user",
+          createdBy: options.ownerCreatedBy ?? "user",
           creationSource: "web",
           modelSelection: {
             instanceId,
@@ -705,6 +707,178 @@ it.effect(
           projection.messages.filter((message) => message.scheduledTaskId === task.id).length,
           0,
         );
+      }),
+    ),
+);
+
+it.effect("refuses an agent-created CEO root even after a real native human message", () =>
+  withNativeFeedback(
+    ({ service, orchestrator }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(yield* nativeFeedbackTask());
+        const result = yield* service.triggerWebhook(feedbackRequest(task)).pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        const projection = yield* orchestrator.getThreadProjection(feedbackOwner);
+        assert.equal(projection.thread.createdBy, "agent");
+        assert.equal(
+          projection.messages.find((message) => message.id === feedbackHuman)?.createdBy,
+          "user",
+        );
+        assert.equal(
+          projection.messages.filter((message) => message.scheduledTaskId === task.id).length,
+          0,
+        );
+      }),
+    { ownerCreatedBy: "agent" },
+  ),
+);
+
+it.effect("refuses peer feedback when the owner's native goal is paused", () =>
+  withNativeFeedback(({ service, orchestrator }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* nativeFeedbackTask());
+      const before = yield* orchestrator.getThreadProjection(feedbackOwner);
+      const providerThread = before.providerThreads.find(
+        (thread) => thread.id === before.thread.activeProviderThreadId,
+      )!;
+      const sink = yield* EventSink.EventSinkV2;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("feedback:goal-pause"),
+            type: "provider-thread.updated",
+            threadId: feedbackOwner,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...providerThread,
+              goal: { objective: "Review the product handoff", status: "paused" },
+            },
+          },
+        ],
+      });
+      const result = yield* service.triggerWebhook(feedbackRequest(task)).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      const projection = yield* orchestrator.getThreadProjection(feedbackOwner);
+      assert.equal(
+        projection.messages.filter((message) => message.scheduledTaskId === task.id).length,
+        0,
+      );
+    }),
+  ),
+);
+
+it.effect.each(["foreign-project", "archived", "snoozed", "failed", "pending-approval"] as const)(
+  "refuses native $0 scope without another provider turn",
+  (state) =>
+    withNativeFeedback(({ service, orchestrator, started, steered }) =>
+      Effect.gen(function* () {
+        const input = yield* nativeFeedbackTask();
+        const { task } = yield* service.upsert(
+          state === "foreign-project"
+            ? { ...input, projectId: ProjectId.make("project:foreign") }
+            : input,
+        );
+        const before = yield* orchestrator.getThreadProjection(feedbackOwner);
+        const run = before.runs[0]!;
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        if (state === "archived") {
+          yield* orchestrator.dispatch({
+            type: "thread.archive",
+            commandId: CommandId.make("feedback:archive"),
+            threadId: feedbackOwner,
+          });
+        } else if (state === "snoozed") {
+          yield* orchestrator.dispatch({
+            type: "thread.snooze",
+            commandId: CommandId.make("feedback:snooze"),
+            threadId: feedbackOwner,
+            snoozedUntil: DateTime.formatIso(DateTime.add(now, { hours: 1 })),
+          });
+        } else if (state === "failed") {
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("feedback:failed"),
+                type: "run.updated",
+                threadId: feedbackOwner,
+                runId: run.id,
+                occurredAt: now,
+                payload: { ...run, status: "failed", completedAt: now },
+              },
+            ],
+          });
+        } else if (state === "pending-approval") {
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("feedback:approval"),
+                type: "runtime-request.updated",
+                threadId: feedbackOwner,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  id: RuntimeRequestId.make("request:approval"),
+                  nodeId: before.providerTurns[0]!.nodeId,
+                  providerTurnId: before.providerTurns[0]!.id,
+                  nativeRequestRef: null,
+                  kind: "command",
+                  status: "pending",
+                  responseCapability: { type: "message" },
+                  createdAt: now,
+                  resolvedAt: null,
+                },
+              },
+            ],
+          });
+        }
+        const result = yield* service.triggerWebhook(feedbackRequest(task)).pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        const after = yield* orchestrator.getThreadProjection(feedbackOwner);
+        assert.equal(
+          after.messages.filter((message) => message.scheduledTaskId === task.id).length,
+          0,
+        );
+        assert.deepEqual(after.thread.modelSelection, before.thread.modelSelection);
+        assert.equal(started.length, 1);
+        assert.equal(steered.length, 0);
+      }),
+    ),
+);
+
+it.effect(
+  "changing a Slack request reference does not reset quota for the same native human message",
+  () =>
+    withNativeFeedback(({ service }) =>
+      Effect.gen(function* () {
+        const input = yield* nativeFeedbackTask();
+        const { task } = yield* service.upsert(input);
+        yield* service.triggerWebhook(feedbackRequest(task));
+        yield* service.triggerWebhook(
+          feedbackRequest(
+            task,
+            feedbackEnvelope({ eventId: "slack:C_PRODUCT:1791359017.000001", peerId: "U_G" }),
+          ),
+        );
+        const policy = { ...feedbackPolicy, humanRequestTs: "1791356868.000001" };
+        const changed = yield* service.upsert({
+          ...input,
+          schedule: { ...input.schedule, type: "webhook", deliveryPolicy: policy },
+        });
+        const result = yield* service
+          .triggerWebhook(
+            feedbackRequest(
+              changed.task,
+              feedbackEnvelope({
+                eventId: "slack:C_PRODUCT:1791359018.000001",
+                humanRequestTs: policy.humanRequestTs,
+                solicitationTs: "1791359017.900001",
+              }),
+            ),
+          )
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.equal((yield* service.list()).tasks[0]?.runCount, 2);
       }),
     ),
 );

@@ -1584,6 +1584,9 @@ export const layer = Layer.effect(
               (message) => message.role === "user" && message.createdBy === "user",
             );
             const latest = target.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+            const nativeGoal = target.providerThreads.find(
+              (providerThread) => providerThread.id === thread.activeProviderThreadId,
+            )?.goal;
             const deliveredMessage = events.find(
               (event) => event.type === "message.updated" && event.payload.id === messageId,
             );
@@ -1600,6 +1603,7 @@ export const layer = Layer.effect(
               thread.archivedAt !== null ||
               thread.deletedAt !== null ||
               thread.settledOverride === "settled" ||
+              (nativeGoal != null && nativeGoal.status !== "active") ||
               (thread.snoozedUntil != null &&
                 DateTime.toEpochMillis(thread.snoozedUntil) > DateTime.toEpochMillis(at)) ||
               human?.id !== policy.humanMessageId ||
@@ -1636,11 +1640,7 @@ export const layer = Layer.effect(
               const value = decodePersistedFeedback(
                 message.text.slice(FEEDBACK_PREFIX.length).split("\n", 1)[0],
               );
-              return Option.isSome(value) &&
-                value.value.humanMessageId === policy.humanMessageId &&
-                value.value.channelId === policy.channelId &&
-                value.value.threadTs === policy.threadTs &&
-                value.value.humanRequestTs === policy.humanRequestTs
+              return Option.isSome(value) && value.value.humanMessageId === policy.humanMessageId
                 ? [value.value]
                 : [];
             });
