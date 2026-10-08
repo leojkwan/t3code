@@ -1,5 +1,31 @@
 import { ThreadId, type OrchestrationV2GoalDispatchPolicy } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+
+export class GoalProviderDispatchError extends Schema.TaggedError<GoalProviderDispatchError>()(
+  "GoalProviderDispatchError",
+  { threadId: ThreadId, cause: Schema.optional(Schema.Defect()) },
+) {}
+
+export interface ProviderDispatchGuardShape {
+  readonly run: <A, E, R>(
+    threadId: ThreadId,
+    work: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | GoalProviderDispatchError, R>;
+}
+
+/** The outbox supplies custody; the provider services place it at the actual call. */
+export class ProviderDispatchGuard extends Context.Reference<
+  ProviderDispatchGuardShape | undefined
+>("t3/GoalHold/ProviderDispatchGuard", {
+  defaultValue: (): ProviderDispatchGuardShape | undefined => undefined,
+}) {}
+
+export const guardProviderCall = <A, E, R>(threadId: ThreadId, work: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(ProviderDispatchGuard, (guard) =>
+    guard === undefined ? work : guard.run(threadId, work),
+  );
 
 export class GoalDispatchHeldError extends Schema.TaggedError<GoalDispatchHeldError>()(
   "GoalDispatchHeldError",

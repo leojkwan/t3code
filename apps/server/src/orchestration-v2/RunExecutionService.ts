@@ -28,6 +28,7 @@ import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as GoalHold from "./GoalHold.ts";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -1409,7 +1410,10 @@ export const layer: Layer.Layer<
                 }),
               ))
             : input.session.startTurn(turnInput);
-          yield* Effect.andThen(shouldStart, startTurn).pipe(
+          yield* Effect.andThen(
+            shouldStart,
+            GoalHold.guardProviderCall(input.run.threadId, startTurn),
+          ).pipe(
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,

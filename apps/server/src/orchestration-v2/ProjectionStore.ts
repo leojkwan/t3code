@@ -691,6 +691,8 @@ export function applyToProjection(
   };
 
   switch (event.type) {
+    case "goal.dispatch-policy.updated":
+      return base;
     case "thread.created":
     case "thread.archived":
     case "thread.unarchived":

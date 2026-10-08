@@ -28,6 +28,7 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import * as GoalHold from "./GoalHold.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -107,6 +108,13 @@ export const layerExecutor: Layer.Layer<
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
+        const guard: GoalHold.ProviderDispatchGuardShape = {
+          run: (threadId, work) =>
+            threads.withProviderDispatch(
+              { threadId, effectId: effect.id, attemptCount: effect.attemptCount },
+              work,
+            ),
+        };
         switch (effect.request.type) {
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
@@ -153,6 +161,7 @@ export const layerExecutor: Layer.Layer<
             return providerTurnStart
               .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
               .pipe(
+                Effect.provideService(GoalHold.ProviderDispatchGuard, guard),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -212,6 +221,7 @@ export const layerExecutor: Layer.Layer<
                 messageId: effect.request.messageId,
               })
               .pipe(
+                Effect.provideService(GoalHold.ProviderDispatchGuard, guard),
                 Effect.tap(() =>
                   Effect.gen(function* () {
                     if (effect.request.type !== "provider-turn.steer") return;
@@ -335,6 +345,7 @@ export const layerExecutor: Layer.Layer<
                     willRetry,
                   }),
                 ),
+                Effect.provideService(GoalHold.ProviderDispatchGuard, guard),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({

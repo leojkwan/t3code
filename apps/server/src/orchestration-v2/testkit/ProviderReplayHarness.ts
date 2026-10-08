@@ -440,6 +440,7 @@ export function layerWithRegistry<Error>(
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       return Layer.mock(ThreadManagementService.ThreadManagementService)({
+        withProviderDispatch: orchestrator.withProviderDispatch,
         dispatch: orchestrator.dispatch,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,

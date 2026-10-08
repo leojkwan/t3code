@@ -1,9 +1,14 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Synchronous fixture observations survive the isolated child process exit.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- This diagnostic harness constructs scratch paths before its Effect runtime exists.
 import * as NodePath from "node:path";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- This harness must exercise two isolated OS processes, never the live server.
+import * as NodeChildProcess from "node:child_process";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  EventId,
   MessageId,
   ScheduledTaskId,
   ProjectId,
@@ -36,6 +41,7 @@ import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as EventSink from "./EventSink.ts";
 import type {
   ProviderAdapterV2Event,
   ProviderAdapterV2InterruptInput,
@@ -54,8 +60,10 @@ import { checkpointWorkspace } from "./testkit/ReplayFixtureWorkspace.ts";
 // and each guard has a negative control that must turn the check red.
 //
 // Covers local dispatch boundaries, tree policy, lock ordering and budget grants.
-// F5 uses two in-process runtimes, not a whole-process restart. F6 and C1 are
-// NOT RUN: this fixture has no external wake/permission or cross-host protocol.
+// F5 keeps the original in-process checks and adds two isolated OS processes
+// over one scratch database/workspace. Native tool/process-tree cancellation,
+// F6 and the complete C1 evolving-plan launch flow remain NOT RUN. C1-outbox
+// proves only that an already admitted provider attempt cannot be replayed.
 
 const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
@@ -65,6 +73,7 @@ interface Stub {
   readonly adapter: ProviderAdapterV2Shape;
   readonly started: ProviderAdapterV2TurnInput[];
   readonly interrupts: ProviderAdapterV2InterruptInput[];
+  readonly steered: string[];
   readonly events: Queue.Queue<ProviderAdapterV2Event>;
 }
 
@@ -73,6 +82,7 @@ const makeStub = (cwd: string) =>
     const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
     const started: ProviderAdapterV2TurnInput[] = [];
     const interrupts: ProviderAdapterV2InterruptInput[] = [];
+    const steered: string[] = [];
     const adapter: ProviderAdapterV2Shape = {
       instanceId,
       driver,
@@ -140,7 +150,10 @@ const makeStub = (cwd: string) =>
                   },
                 });
               }),
-            steerTurn: () => Effect.die("unused"),
+            steerTurn: (input) =>
+              Effect.sync(() => {
+                steered.push(input.message.messageId);
+              }),
             interruptTurn: (interrupt) =>
               Effect.sync(() => {
                 interrupts.push(interrupt);
@@ -152,7 +165,7 @@ const makeStub = (cwd: string) =>
           };
         }),
     };
-    return { adapter, started, interrupts, events } satisfies Stub;
+    return { adapter, started, interrupts, steered, events } satisfies Stub;
   });
 
 interface Observation {
@@ -180,6 +193,7 @@ const heldQueueCheck = (obs: Observation, startsBeforeStop: number) =>
   obs.stubStarts === startsBeforeStop;
 
 interface PhaseOptions {
+  readonly workspacePath?: string;
   // A second runtime over the same stored data: skip thread creation, own layer name.
   readonly existingThread?: boolean;
   readonly layerName?: string;
@@ -187,11 +201,298 @@ interface PhaseOptions {
   readonly recoverOnStartup?: boolean;
 }
 
+it.effect("F2-outbox a committed provider start observes a later durable hold", () =>
+  withHarness("outbox-held", ({ orchestrator, worker, stub, threadId }) =>
+    Effect.gen(function* () {
+      yield* orchestrator.dispatch(messageCommand(threadId, "outbox-before-hold"));
+      yield* orchestrator.dispatch({
+        type: "goal.hold",
+        commandId: CommandId.make("outbox-hold"),
+        threadId,
+        hold: "stop-before-provider",
+      });
+      yield* worker.drain();
+      assert.equal(stub.started.length, 0);
+      yield* orchestrator.dispatch({
+        type: "goal.resume",
+        commandId: CommandId.make("outbox-resume"),
+        threadId,
+      });
+      yield* orchestrator.dispatch(messageCommand(threadId, "outbox-after-resume"));
+      yield* worker.drain();
+      assert.equal(stub.started.length, 1, "Explicit Resume must permit a real stub start");
+    }),
+  ),
+);
+
+it.effect("B2-outbox a lowered budget refuses an already committed provider request", () =>
+  withHarness("outbox-budget", ({ orchestrator, worker, stub, threadId }) =>
+    Effect.gen(function* () {
+      yield* orchestrator.dispatch({
+        type: "goal.budget.set",
+        commandId: CommandId.make("outbox-budget-one"),
+        threadId,
+        limit: 1,
+      });
+      yield* orchestrator.dispatch(messageCommand(threadId, "outbox-reserved"));
+      yield* orchestrator.dispatch({
+        type: "goal.budget.set",
+        commandId: CommandId.make("outbox-budget-zero"),
+        threadId,
+        limit: 0,
+      });
+      yield* worker.drain();
+      assert.equal(stub.started.length, 0);
+    }),
+  ),
+);
+
+it.effect("B2-retry a recovered outbox attempt requires another provider budget slot", () =>
+  withHarness("outbox-retry", ({ orchestrator, worker, stub, threadId, sql }) =>
+    Effect.gen(function* () {
+      yield* orchestrator.dispatch({
+        type: "goal.budget.set",
+        commandId: CommandId.make("retry-budget-one"),
+        threadId,
+        limit: 1,
+      });
+      yield* orchestrator.dispatch(messageCommand(threadId, "retry-reserved"));
+      // An interrupted worker persists its attempted lease before a later worker
+      // reclaims it. Exercise that persisted retry state through the real worker.
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET attempt_count = 1 WHERE effect_type = 'provider-turn.start'`;
+      yield* worker.drain();
+      assert.equal(stub.started.length, 0);
+      const receipts =
+        yield* sql`SELECT command_id FROM orchestration_command_receipts WHERE command_type = 'goal.provider-dispatch'`;
+      assert.equal(receipts.length, 0, "Refused retries must not record provider admission");
+    }),
+  ),
+);
+
+it.effect.each(["restart_active", "steer_active"] as const)(
+  "F2-outbox $0 rechecks the hold at its provider call",
+  (type) =>
+    withHarness(`outbox-${type}`, ({ orchestrator, worker, stub, threadId, sink }) =>
+      Effect.gen(function* () {
+        const running = yield* waitForRunning(orchestrator);
+        yield* orchestrator.dispatch(messageCommand(threadId, `${type}-first`));
+        yield* worker.drain();
+        yield* Fiber.join(running);
+        assert.equal(stub.started.length, 1);
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const run = before.runs[0]!;
+        yield* orchestrator.dispatch({
+          ...messageCommand(threadId, `${type}-pending`),
+          dispatchMode: { type, targetRunId: run.id },
+        });
+        if (type === "restart_active") {
+          // A restart waits for the external provider's old turn to end. Supply
+          // that acknowledgement explicitly so this case reaches the new start
+          // rather than passing because the restart was unable to proceed.
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("restart-provider-ack"),
+                type: "provider-turn.updated",
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: { ...before.providerTurns[0]!, status: "interrupted", completedAt: now },
+              },
+            ],
+          });
+        }
+        yield* orchestrator.dispatch({
+          type: "goal.hold",
+          commandId: CommandId.make(`${type}-hold`),
+          threadId,
+          hold: "stop-before-call",
+        });
+        yield* worker.drain();
+        assert.equal(stub.started.length, 1);
+        assert.equal(stub.steered.length, 0);
+      }),
+    ),
+);
+
+it.effect("C1-outbox an admitted attempt cannot call its provider again on replay", () =>
+  withHarness("outbox-replay", ({ orchestrator, worker, stub, threadId, sql }) =>
+    Effect.gen(function* () {
+      yield* orchestrator.dispatch(messageCommand(threadId, "outbox-once"));
+      yield* worker.drain();
+      assert.equal(stub.started.length, 1);
+      const rows = yield* sql<{ effect_id: string; attempt_count: number }>`
+        SELECT effect_id, attempt_count FROM orchestration_v2_effect_outbox
+        WHERE effect_type = 'provider-turn.start'`;
+      assert.equal(rows.length, 1);
+      const effect = rows[0]!;
+      // Re-present the same claimed attempt, as a stale executor would. The
+      // durable provider-admission receipt must refuse its external callback.
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'running' WHERE effect_id = ${effect.effect_id}`;
+      let calls = 0;
+      const replay = yield* Effect.result(
+        orchestrator.withProviderDispatch(
+          {
+            threadId,
+            effectId: effect.effect_id,
+            attemptCount: effect.attempt_count,
+          },
+          Effect.sync(() => {
+            calls += 1;
+          }),
+        ),
+      );
+      assert.equal(replay._tag, "Failure");
+      assert.equal(calls, 0);
+      assert.equal(stub.started.length, 1);
+    }),
+  ),
+);
+
+it.live("F5-process Stop survives a process exit and explicit Resume starts the stub", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const phase = process.env.DG04_STOP_PROCESS_PHASE;
+      if (phase !== undefined) {
+        assert.ok(phase === "write" || phase === "read");
+        const databasePath = process.env.DG04_STOP_PROCESS_DB!;
+        assert.ok(databasePath.includes("dg04-isolated-process-"));
+        return yield* withHarness(
+          "process-stop",
+          ({ orchestrator, worker, stub, threadId }) =>
+            Effect.gen(function* () {
+              if (phase === "write") {
+                yield* orchestrator.dispatch({
+                  type: "goal.budget.set",
+                  commandId: CommandId.make("process-budget"),
+                  threadId,
+                  limit: 2,
+                });
+                const running = yield* waitForRunning(orchestrator);
+                yield* orchestrator.dispatch(messageCommand(threadId, "process-first"));
+                yield* worker.drain();
+                yield* Fiber.join(running);
+                yield* orchestrator.dispatch({
+                  type: "goal.hold",
+                  commandId: CommandId.make("process-hold"),
+                  threadId,
+                  hold: "operator-stop",
+                });
+                yield* orchestrator.dispatch({
+                  type: "thread.stop",
+                  commandId: CommandId.make("process-stop"),
+                  threadId,
+                });
+                yield* worker.drain();
+                assert.equal(stub.started.length, 1);
+              } else {
+                const held = yield* Effect.result(
+                  orchestrator.dispatch(messageCommand(threadId, "process-held-send")),
+                );
+                assert.equal(held._tag, "Failure");
+                if (held._tag === "Failure")
+                  assert.equal(held.failure._tag, "GoalDispatchHeldError");
+                yield* worker.drain();
+                assert.equal(stub.started.length, 0);
+                yield* orchestrator.dispatch({
+                  type: "goal.resume",
+                  commandId: CommandId.make("process-resume"),
+                  threadId,
+                });
+                const running = yield* waitForRunning(orchestrator);
+                yield* orchestrator.dispatch(messageCommand(threadId, "process-after-resume"));
+                yield* worker.drain();
+                yield* Fiber.join(running);
+                assert.equal(stub.started.length, 1);
+              }
+              const projection = yield* orchestrator.getThreadProjection(threadId);
+              NodeFS.writeFileSync(
+                `${databasePath}.${phase}.json`,
+                JSON.stringify({
+                  phase,
+                  pid: process.pid,
+                  starts: stub.started.length,
+                  runs: projection.runs.map((r) => r.status),
+                }),
+              );
+            }),
+          {
+            databasePath,
+            workspacePath: process.env.DG04_STOP_PROCESS_CWD!,
+            existingThread: phase === "read",
+            recoverOnStartup: phase === "read",
+          },
+        );
+      }
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "dg04-isolated-process-")),
+        ),
+        (directory) =>
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const databasePath = NodePath.join(directory, "state.sqlite");
+      // Both runtimes must use a workspace that survives the first process. A
+      // phase-local checkpointWorkspace is deleted when that phase's scope ends.
+      const workspacePath = yield* checkpointWorkspace("process-stop-shared");
+      for (const phase of ["write", "read"] as const) {
+        yield* Effect.promise(
+          (signal) =>
+            new Promise<void>((resolve, reject) => {
+              NodeChildProcess.execFile(
+                NodePath.resolve("node_modules/.bin/vp"),
+                [
+                  "test",
+                  "run",
+                  "apps/server/src/orchestration-v2/StopFalsifierHarness.integration.test.ts",
+                  "-t",
+                  "^F5-process Stop",
+                ],
+                {
+                  cwd: process.cwd(),
+                  signal,
+                  timeout: 40_000,
+                  env: {
+                    ...process.env,
+                    DG04_STOP_PROCESS_PHASE: phase,
+                    DG04_STOP_PROCESS_DB: databasePath,
+                    DG04_STOP_PROCESS_CWD: workspacePath,
+                  },
+                },
+                (error, stdout, stderr) =>
+                  error ? reject({ phase, error, stdout, stderr }) : resolve(),
+              );
+            }),
+        );
+      }
+      const written = JSON.parse(NodeFS.readFileSync(`${databasePath}.write.json`, "utf8"));
+      const read = JSON.parse(NodeFS.readFileSync(`${databasePath}.read.json`, "utf8"));
+      assert.notEqual(written.pid, read.pid);
+      assert.notEqual(written.pid, process.pid);
+      assert.notEqual(read.pid, process.pid);
+      assert.equal(read.starts, 1);
+      assert.equal(written.starts, 1);
+      assert.ok(written.runs.every((status: string) => status === "interrupted"));
+      assert.equal(read.runs.length, written.runs.length + 1);
+      assert.equal(read.runs.at(-1), "running");
+      report("PASS-whole-process-hold-resume", {
+        case: `F5-process-parent:${process.pid}-write:${written.pid}-read:${read.pid}`,
+        runStatuses: read.runs,
+        queueHeld: [],
+        stubStarts: read.starts,
+        interrupts: 0,
+      });
+    }),
+  ),
+);
+
 const withHarness = <A, E>(
   name: string,
   body: (input: {
     readonly orchestrator: Orchestrator.OrchestratorV2Shape;
     readonly worker: EffectWorker.OrchestrationEffectWorkerV2Shape;
+    readonly sink: EventSink.EventSinkV2["Service"];
     readonly sql: SqlClient.SqlClient;
     readonly executor: ThreadCommandExecutor.ThreadCommandExecutor["Service"];
     readonly management: ThreadManagementService.ThreadManagementServiceShape;
@@ -210,12 +511,13 @@ const withHarness = <A, E>(
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const cwd = yield* checkpointWorkspace(name);
+      const cwd = options.workspacePath ?? (yield* checkpointWorkspace(name));
       const stub = yield* makeStub(cwd);
       let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
         const threadId = ThreadId.make(`thread:${name}`);
         if (options.existingThread !== true) {
           yield* orchestrator.dispatch({
@@ -265,6 +567,7 @@ const withHarness = <A, E>(
         return yield* body({
           orchestrator,
           worker,
+          sink,
           stub,
           threadId,
           observe,

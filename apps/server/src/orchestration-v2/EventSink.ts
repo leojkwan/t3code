@@ -126,6 +126,8 @@ export interface EventSinkV2Shape {
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
+    /** Validated inside the receipt/event transaction, before any reservation. */
+    readonly beforeCommit?: Effect.Effect<void, EventSinkWriteError>;
     readonly cancelUnsettledEffects?: {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
@@ -529,6 +531,7 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          yield* input.beforeCommit ?? Effect.void;
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,

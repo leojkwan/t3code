@@ -91,7 +91,7 @@ import { notificationTurnItem } from "./Notification.ts";
 import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 import { EventStoreV2 } from "./EventStore.ts";
-import { EventSinkV2 } from "./EventSink.ts";
+import { EventSinkV2, EventSinkWriteError } from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
@@ -277,6 +277,14 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  readonly withProviderDispatch: <A, E, R>(
+    input: {
+      readonly threadId: ThreadId;
+      readonly effectId: string;
+      readonly attemptCount: number;
+    },
+    work: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | GoalHold.GoalProviderDispatchError, R>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   /** Startup pass that settles delegated-task results and deliveries runs left behind. */
   readonly recoverDelegatedTasks: Effect.Effect<void>;
@@ -880,6 +888,92 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (refused !== undefined) return yield* refused;
       return { root, policy };
     });
+
+  const withProviderDispatch: OrchestratorV2Shape["withProviderDispatch"] = (input, work) =>
+    withGoalDispatchLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const commandId = CommandId.make(`goal-provider:${input.effectId}:${input.attemptCount}`);
+        const admission = Effect.gen(function* () {
+          // The first attempt was reserved with its outbox request. A retry is
+          // another possible provider request and requires another budget slot.
+          const requests = input.attemptCount > 1 ? 1 : 0;
+          const { root, policy } = yield* checkGoalDispatch(input.threadId, requests);
+          const claimed = yield* effectOutbox.get(input.effectId);
+          if (
+            Option.isNone(claimed) ||
+            claimed.value.threadId !== input.threadId ||
+            claimed.value.status !== "running" ||
+            claimed.value.attemptCount !== input.attemptCount
+          ) {
+            return yield* new GoalHold.GoalProviderDispatchError({
+              threadId: input.threadId,
+              cause: "Provider dispatch requires its current claimed outbox attempt.",
+            });
+          }
+          const prior = yield* commandReceipts.getByCommandId(commandId);
+          if (Option.isSome(prior)) {
+            return yield* new GoalHold.GoalProviderDispatchError({
+              threadId: input.threadId,
+              cause:
+                "This provider attempt was already admitted; reconcile instead of replaying it.",
+            });
+          }
+          const now = yield* DateTime.now;
+          const event = yield* makeSystemEvent({
+            type: "goal.dispatch-policy.updated",
+            threadId: root,
+            occurredAt: now,
+            payload: { ...policy, used: policy.used + requests },
+          });
+          const committed = yield* eventSink.commitCommand({
+            commandId,
+            threadId: root,
+            commandType: "goal.provider-dispatch",
+            acceptedAt: now,
+            events: [event],
+            effects: [],
+            beforeCommit: Effect.gen(function* () {
+              const current = yield* readGoalPolicy(root);
+              const refused = GoalHold.refusal(current, input.threadId, root, requests);
+              if (refused !== undefined) return yield* refused;
+              if (
+                current.used !== policy.used ||
+                current.limit !== policy.limit ||
+                current.hold !== policy.hold ||
+                current.grant !== policy.grant
+              ) {
+                return yield* new GoalHold.GoalProviderDispatchError({
+                  threadId: input.threadId,
+                  cause: "Goal policy changed before provider admission.",
+                });
+              }
+            }).pipe(
+              Effect.mapError(
+                (cause) => new EventSinkWriteError({ commandId, eventCount: 1, cause }),
+              ),
+            ),
+          });
+          if (!committed.committed)
+            return yield* new GoalHold.GoalProviderDispatchError({
+              threadId: input.threadId,
+              cause: "Provider admission already committed; external replay refused.",
+            });
+        }).pipe(
+          Effect.mapError(
+            (cause) => new GoalHold.GoalProviderDispatchError({ threadId: input.threadId, cause }),
+          ),
+        );
+        yield* admission;
+        return yield* work;
+      }),
+    ).pipe(
+      Effect.mapError((cause) =>
+        Schema.is(OrchestratorProjectionError)(cause)
+          ? new GoalHold.GoalProviderDispatchError({ threadId: input.threadId, cause })
+          : cause,
+      ),
+    );
 
   const isProviderDispatch = (effect: PendingOrchestrationEffectV2) =>
     effect.request.type === "provider-turn.start" ||
@@ -10975,6 +11069,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
   return OrchestratorV2.of({
+    withProviderDispatch,
     resumeQueuedRuns,
     recoverDelegatedTasks,
     recoverDelegatedTask,
@@ -11125,6 +11220,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
       }),
     ),
     recoverDelegatedTasks: Effect.void,
+    withProviderDispatch: ({ threadId }) =>
+      Effect.fail(
+        new GoalHold.GoalProviderDispatchError({
+          threadId,
+          cause: "Live runtime is not configured.",
+        }),
+      ),
     recoverDelegatedTask: () => Effect.void,
     delegatedTaskResultPending: () => Effect.succeed(false),
     dispatch: (command) =>

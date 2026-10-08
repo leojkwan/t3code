@@ -10,6 +10,7 @@ import {
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as GoalHold from "./GoalHold.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -314,8 +315,9 @@ export const layer: Layer.Layer<
               cause: "The persisted steering message or target run is missing.",
             });
           }
-          yield* loaded.session.value
-            .steerTurn({
+          yield* GoalHold.guardProviderCall(
+            input.threadId,
+            loaded.session.value.steerTurn({
               threadId: input.threadId,
               runId: run.id,
               providerThread: loaded.providerThread,
@@ -336,24 +338,21 @@ export const layer: Layer.Layer<
                   ? {}
                   : { senderThreadId: message.senderThreadId }),
               },
-            })
-            .pipe(
-              Effect.catch((cause) =>
-                Effect.gen(function* () {
-                  const current = yield* projections.getProviderControlContext(
-                    input.threadId,
-                    input,
-                  );
-                  return yield* new ProviderTurnControlError({
-                    threadId: input.threadId,
-                    operation: "steer",
-                    providerTurnId: input.providerTurnId,
-                    turnCompleted: current.providerTurn?.status === "completed",
-                    cause,
-                  });
-                }),
-              ),
-            );
+            }),
+          ).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const current = yield* projections.getProviderControlContext(input.threadId, input);
+                return yield* new ProviderTurnControlError({
+                  threadId: input.threadId,
+                  operation: "steer",
+                  providerTurnId: input.providerTurnId,
+                  turnCompleted: current.providerTurn?.status === "completed",
+                  cause,
+                });
+              }),
+            ),
+          );
         }).pipe(
           Effect.mapError((cause) =>
             isProviderTurnControlError(cause)

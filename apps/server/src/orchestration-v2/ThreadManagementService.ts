@@ -275,6 +275,7 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  readonly withProviderDispatch: Orchestrator.OrchestratorV2["Service"]["withProviderDispatch"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, Orchestrator.OrchestratorV2Error>;
@@ -869,6 +870,7 @@ const make = Effect.gen(function* () {
     });
 
   return ThreadManagementService.of({
+    withProviderDispatch: orchestrator.withProviderDispatch,
     ensureLegacyTranscript,
     searchThreadStream: (input) =>
       Stream.unwrap(
