@@ -327,3 +327,61 @@ it.effect("F2-send a new message to a stopped thread is recorded, not assumed re
     }),
   ),
 );
+
+// F1 (doc-only flag): a plan or chat that says "stopped" changes nothing in the
+// runtime. With no hold set, a queued follow-up starts once the active turn ends,
+// so the harness must report that the flag alone did not stop it.
+it.effect("F1 without a hold the queued follow-up starts when the active turn completes", () =>
+  withHarness("stop-f1", ({ orchestrator, worker, stub, threadId, observe, send }) =>
+    Effect.gen(function* () {
+      const running = yield* waitForRunning(orchestrator);
+      yield* send("first", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      yield* send("follow-up", "queue_after_active");
+      const before = yield* observe("F1-queued-before-release");
+      assert.equal(before.runStatuses.at(-1), "queued");
+      const turn = stub.started[0]!;
+      const now = yield* DateTime.now;
+      const ended = yield* orchestrator.streamDomainEvents.pipe(
+        Stream.filter(
+          (event: OrchestrationV2DomainEvent) =>
+            event.type === "run.updated" &&
+            event.payload.status !== "running" &&
+            event.payload.status !== "queued" &&
+            event.payload.status !== "starting",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      const projectionBefore = yield* orchestrator.getThreadProjection(threadId);
+      const providerTurn = projectionBefore.providerTurns[0]!;
+      yield* Queue.offer(stub.events, {
+        type: "provider_turn.updated",
+        driver,
+        providerTurn: { ...providerTurn, status: "completed", completedAt: now },
+      });
+      yield* Queue.offer(stub.events, {
+        type: "turn.terminal",
+        driver,
+        providerThreadId: providerTurn.providerThreadId,
+        providerTurnId: providerTurn.id,
+        runOrdinal: turn.runOrdinal,
+        status: "completed",
+        failure: null,
+        threadDisposition: "reusable",
+      });
+      yield* Fiber.join(ended);
+      yield* worker.drain();
+      yield* orchestrator.resumeQueuedRuns;
+      yield* worker.drain();
+      const after = yield* observe("F1-after-release");
+      const released = after.stubStarts === 2;
+      report(released ? "PASS-doc-only-flag-does-not-stop-the-queued-turn" : "UNEXPECTED", after);
+      assert.ok(released, JSON.stringify(after));
+      // Negative control: before the release the stub has started one turn only.
+      assert.equal(before.stubStarts, 1);
+    }),
+  ),
+);
