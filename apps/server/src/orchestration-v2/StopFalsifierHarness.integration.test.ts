@@ -360,7 +360,7 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
         assert.ok(databasePath.includes("dg04-isolated-process-"));
         return yield* withHarness(
           "process-stop",
-          ({ orchestrator, worker, stub, threadId }) =>
+          ({ orchestrator, worker, stub, threadId, send }) =>
             Effect.gen(function* () {
               if (phase === "write") {
                 yield* orchestrator.dispatch({
@@ -373,6 +373,7 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
                 yield* orchestrator.dispatch(messageCommand(threadId, "process-first"));
                 yield* worker.drain();
                 yield* Fiber.join(running);
+                yield* send("process-queued", "queue_after_active");
                 yield* orchestrator.dispatch({
                   type: "goal.hold",
                   commandId: CommandId.make("process-hold"),
@@ -400,8 +401,14 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
                   commandId: CommandId.make("process-resume"),
                   threadId,
                 });
+                yield* worker.drain();
+                assert.equal(stub.started.length, 0, "Goal Resume must preserve the held queue");
                 const running = yield* waitForRunning(orchestrator);
-                yield* orchestrator.dispatch(messageCommand(threadId, "process-after-resume"));
+                yield* orchestrator.dispatch({
+                  type: "queue.resume",
+                  commandId: CommandId.make("process-queue-resume"),
+                  threadId,
+                });
                 yield* worker.drain();
                 yield* Fiber.join(running);
                 assert.equal(stub.started.length, 1);
@@ -414,6 +421,9 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
                   pid: process.pid,
                   starts: stub.started.length,
                   runs: projection.runs.map((r) => r.status),
+                  runIds: projection.runs.map((r) => r.id),
+                  queueHeld: projection.runs.map((r) => r.queueHeld === true),
+                  startedRunIds: stub.started.map((turn) => turn.runId),
                 }),
               );
             }),
@@ -448,6 +458,11 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
                   "apps/server/src/orchestration-v2/StopFalsifierHarness.integration.test.ts",
                   "-t",
                   "^F5-process Stop",
+                  "--maxWorkers=1",
+                  "--no-file-parallelism",
+                  "--maxConcurrency=1",
+                  "--testTimeout=10000",
+                  "--retry=0",
                 ],
                 {
                   cwd: process.cwd(),
@@ -473,13 +488,17 @@ it.live("F5-process Stop survives a process exit and explicit Resume starts the 
       assert.notEqual(read.pid, process.pid);
       assert.equal(read.starts, 1);
       assert.equal(written.starts, 1);
-      assert.ok(written.runs.every((status: string) => status === "interrupted"));
-      assert.equal(read.runs.length, written.runs.length + 1);
+      assert.deepEqual(written.runs, ["interrupted", "queued"]);
+      assert.deepEqual(written.queueHeld, [false, true]);
+      assert.deepEqual(read.runIds, written.runIds, "Resume must reuse the persisted queued run");
+      assert.deepEqual(read.startedRunIds, [written.runIds[1]]);
+      assert.equal(read.runs.length, written.runs.length);
       assert.equal(read.runs.at(-1), "running");
-      report("PASS-whole-process-hold-resume", {
+      assert.deepEqual(read.queueHeld, [false, false]);
+      report("PASS-whole-process-queued-resume", {
         case: `F5-process-parent:${process.pid}-write:${written.pid}-read:${read.pid}`,
         runStatuses: read.runs,
-        queueHeld: [],
+        queueHeld: read.queueHeld,
         stubStarts: read.starts,
         interrupts: 0,
       });
@@ -832,71 +851,66 @@ it.effect("F5 restart while stopped starts nothing until an explicit resume", ()
     NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "dg03-f5-")),
     "orchestration.sqlite",
   );
-  return Effect.gen(function* () {
-    const beforeRestart = yield* withHarness(
-      "stop-f5",
-      ({ orchestrator, worker, threadId, observe, send }) =>
-        Effect.gen(function* () {
-          const running = yield* waitForRunning(orchestrator);
-          yield* send("first", "start_immediately");
-          yield* worker.drain();
-          yield* Fiber.join(running);
-          yield* send("follow-up", "queue_after_active");
-          yield* orchestrator.dispatch({
-            type: "thread.stop",
-            commandId: CommandId.make("stop-f5"),
-            threadId,
-          });
-          yield* worker.drain();
-          return yield* observe("F5-runtime-A-after-stop");
-        }),
-      { databasePath, layerName: "stop-f5-a" },
-    );
-    assert.ok(heldQueueCheck(beforeRestart, 1), JSON.stringify(beforeRestart));
-    yield* withHarness(
-      "stop-f5",
-      ({ orchestrator, worker, threadId, observe }) =>
-        Effect.gen(function* () {
-          yield* worker.drain();
-          const restarted = yield* observe("F5-runtime-B-after-restart");
-          report(heldQueueCheck(restarted, 0) ? "PASS" : "FAIL", restarted);
-          assert.ok(heldQueueCheck(restarted, 0), JSON.stringify(restarted));
-          assert.deepEqual(restarted.runStatuses, beforeRestart.runStatuses);
-          // Negative control: the explicit queue.resume command releases the held run.
-          // (resumeQueuedRuns alone does not: it leaves a held run held.)
-          yield* orchestrator.dispatch({
-            type: "queue.resume",
-            commandId: CommandId.make("resume-f5"),
-            threadId,
-          });
-          yield* worker.drain();
-          // The released run is "starting" until the provider session is rebuilt after the
-          // restart; give it a bounded number of drains before judging.
-          let resumed = yield* observe("F5-runtime-B-after-explicit-resume");
-          for (let attempt = 0; attempt < 200 && resumed.stubStarts === 0; attempt += 1) {
-            yield* Effect.yieldNow;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const workspacePath = yield* checkpointWorkspace("stop-f5-shared");
+      const beforeRestart = yield* withHarness(
+        "stop-f5",
+        ({ orchestrator, worker, threadId, observe, send }) =>
+          Effect.gen(function* () {
+            const running = yield* waitForRunning(orchestrator);
+            yield* send("first", "start_immediately");
             yield* worker.drain();
-            resumed = yield* observe("F5-runtime-B-after-explicit-resume");
-          }
-          // Control: only the explicit queue.resume clears the hold and moves the run on.
-          // Whether the stub then receives the turn after a restart is NOT asserted: the
-          // persisted provider session from runtime A is "stopped" and the run stayed
-          // "starting" with zero stub starts, cause not isolated (harness artifact or product).
-          const released =
-            resumed.queueHeld.at(-1) === false && resumed.runStatuses.at(-1) !== "queued";
-          report(
-            released
-              ? resumed.stubStarts === 1
-                ? "PASS-resume-releases-and-starts"
-                : "PASS-resume-clears-hold-START-UNPROVED"
-              : "UNEXPECTED",
-            resumed,
-          );
-          assert.ok(released, JSON.stringify(resumed));
-        }),
-      { databasePath, layerName: "stop-f5-b", existingThread: true, recoverOnStartup: true },
-    );
-  });
+            yield* Fiber.join(running);
+            yield* send("follow-up", "queue_after_active");
+            yield* orchestrator.dispatch({
+              type: "thread.stop",
+              commandId: CommandId.make("stop-f5"),
+              threadId,
+            });
+            yield* worker.drain();
+            return yield* observe("F5-runtime-A-after-stop");
+          }),
+        { databasePath, workspacePath, layerName: "stop-f5-a" },
+      );
+      assert.ok(heldQueueCheck(beforeRestart, 1), JSON.stringify(beforeRestart));
+      yield* withHarness(
+        "stop-f5",
+        ({ orchestrator, worker, threadId, observe }) =>
+          Effect.gen(function* () {
+            yield* worker.drain();
+            const restarted = yield* observe("F5-runtime-B-after-restart");
+            report(heldQueueCheck(restarted, 0) ? "PASS" : "FAIL", restarted);
+            assert.ok(heldQueueCheck(restarted, 0), JSON.stringify(restarted));
+            assert.deepEqual(restarted.runStatuses, beforeRestart.runStatuses);
+            // Negative control: the explicit queue.resume command releases the held run.
+            // (resumeQueuedRuns alone does not: it leaves a held run held.)
+            const running = yield* waitForRunning(orchestrator);
+            yield* orchestrator.dispatch({
+              type: "queue.resume",
+              commandId: CommandId.make("resume-f5"),
+              threadId,
+            });
+            yield* worker.drain();
+            yield* Fiber.join(running);
+            const resumed = yield* observe("F5-runtime-B-after-explicit-resume");
+            // The persisted workspace survives both runtimes. Clearing the hold alone
+            // is insufficient: the queued turn must actually reach the provider.
+            report("PASS-resume-releases-and-starts", resumed);
+            assert.equal(resumed.queueHeld.at(-1), false, JSON.stringify(resumed));
+            assert.equal(resumed.runStatuses.at(-1), "running", JSON.stringify(resumed));
+            assert.equal(resumed.stubStarts, 1, JSON.stringify(resumed));
+          }),
+        {
+          databasePath,
+          workspacePath,
+          layerName: "stop-f5-b",
+          existingThread: true,
+          recoverOnStartup: true,
+        },
+      );
+    }),
+  );
 });
 
 const messageCommand = (threadId: ThreadId, id: string) => ({
