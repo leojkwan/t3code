@@ -22,6 +22,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
+import * as GoalHold from "./GoalHold.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
@@ -510,3 +511,43 @@ it.effect.each([
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
   }),
 );
+
+it.effect("sendToThread preserves the authoritative typed goal refusal", () => {
+  const projectId = ProjectId.make("project:held-send");
+  const threadId = ThreadId.make("thread:held-send");
+  const refusal = new GoalHold.GoalDispatchHeldError({
+    threadId,
+    goalThreadId: threadId,
+    hold: "operator-stop",
+  });
+  const projection = {
+    thread: { id: threadId, projectId, deletedAt: null, archivedAt: null },
+    runs: [],
+    providerTurns: [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const layer = ThreadManagementService.layer.pipe(
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () => Effect.succeed(projection),
+        dispatch: () => Effect.fail(refusal),
+      }),
+    ),
+  );
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(
+      service.sendToThread({
+        projectId,
+        threadId,
+        commandId: CommandId.make("held-send"),
+        messageId: MessageId.make("held-message"),
+        text: "continue",
+        attachments: [],
+        mode: "queue",
+        createdBy: "agent",
+        creationSource: "mcp",
+      }),
+    );
+    expect(error).toBe(refusal);
+  }).pipe(Effect.provide(layer));
+});

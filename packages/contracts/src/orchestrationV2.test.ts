@@ -1504,3 +1504,25 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
 });
+
+const isGoalControlCommand = Schema.is(OrchestrationV2Command);
+
+describe("goal dispatch controls", () => {
+  it("decodes explicit hold, resume and budget commands and rejects an empty grant", () => {
+    const base = { commandId: "goal-control", threadId: "goal-root" };
+    expect(isGoalControlCommand({ ...base, type: "goal.hold", hold: "operator-stop" })).toBe(true);
+    expect(isGoalControlCommand({ ...base, type: "goal.resume" })).toBe(true);
+    expect(
+      isGoalControlCommand({
+        ...base,
+        type: "goal.budget.set",
+        limit: 2,
+        grant: "approval-1",
+      }),
+    ).toBe(true);
+    expect(isGoalControlCommand({ ...base, type: "goal.budget.set", limit: -1 })).toBe(false);
+    expect(isGoalControlCommand({ ...base, type: "goal.budget.set", limit: 3, grant: " " })).toBe(
+      false,
+    );
+  });
+});

@@ -5,6 +5,7 @@ import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
+  ScheduledTaskId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -13,6 +14,16 @@ import {
   ThreadId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import * as Scope from "effect/Scope";
+import * as Deferred from "effect/Deferred";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -21,6 +32,7 @@ import * as Queue from "effect/Queue";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Stream from "effect/Stream";
+import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -41,9 +53,9 @@ import { checkpointWorkspace } from "./testkit/ReplayFixtureWorkspace.ts";
 // service or provider. Each case reports what the current source did (OBS lines)
 // and each guard has a negative control that must turn the check red.
 //
-// Cases here cover the spec cases that need no goal-level hold: F1, F2 (queue
-// promotion and a send to a stopped thread), F3. Cases F4-F6, B1-B3 and C1 are
-// NOT RUN.
+// Covers local dispatch boundaries, tree policy, lock ordering and budget grants.
+// F5 uses two in-process runtimes, not a whole-process restart. F6 and C1 are
+// NOT RUN: this fixture has no external wake/permission or cross-host protocol.
 
 const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
@@ -180,6 +192,12 @@ const withHarness = <A, E>(
   body: (input: {
     readonly orchestrator: Orchestrator.OrchestratorV2Shape;
     readonly worker: EffectWorker.OrchestrationEffectWorkerV2Shape;
+    readonly sql: SqlClient.SqlClient;
+    readonly executor: ThreadCommandExecutor.ThreadCommandExecutor["Service"];
+    readonly management: ThreadManagementService.ThreadManagementServiceShape;
+    readonly scheduled: ScheduledTaskService.ScheduledTaskService["Service"];
+    readonly pollScheduled: Effect.Effect<void>;
+
     readonly stub: Stub;
     readonly threadId: ThreadId;
     readonly observe: (caseName: string) => Effect.Effect<Observation>;
@@ -187,13 +205,14 @@ const withHarness = <A, E>(
       id: string,
       mode: "start_immediately" | "queue_after_active",
     ) => Effect.Effect<void>;
-  }) => Effect.Effect<A, E, never>,
+  }) => Effect.Effect<A, E, Scope.Scope>,
   options: PhaseOptions = {},
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace(name);
       const stub = yield* makeStub(cwd);
+      let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
@@ -239,24 +258,79 @@ const withHarness = <A, E>(
               interrupts: stub.interrupts.length,
             } satisfies Observation;
           }).pipe(Effect.orDie);
-        return yield* body({ orchestrator, worker, stub, threadId, observe, send });
+        const sql = yield* SqlClient.SqlClient;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const management = yield* ThreadManagementService.ThreadManagementService;
+        const scheduled = yield* ScheduledTaskService.ScheduledTaskService;
+        return yield* body({
+          orchestrator,
+          worker,
+          stub,
+          threadId,
+          observe,
+          send,
+          sql,
+          executor,
+          management,
+          scheduled,
+          pollScheduled: Effect.suspend(() => pollScheduled),
+        });
       }).pipe(
         Effect.provide(
-          ProviderReplayHarness.layerWithRegistry(
-            { name: options.layerName ?? name },
-            ProviderAdapterRegistry.layerSingle(stub.adapter),
-            {
-              runEffectWorker: false,
-              ...(options.databasePath === undefined
-                ? {}
-                : {
-                    databaseLayer: SqlitePersistence.layerFromPath(options.databasePath).pipe(
-                      Layer.provide(NodeServices.layer),
-                    ),
+          (() => {
+            const databaseLayer =
+              options.databasePath === undefined
+                ? SqlitePersistence.layerMemory
+                : SqlitePersistence.layerFromPath(options.databasePath).pipe(
+                    Layer.provide(NodeServices.layer),
+                  );
+            const runtime = ProviderReplayHarness.layerWithRegistry(
+              { name: options.layerName ?? name },
+              ProviderAdapterRegistry.layerSingle(stub.adapter),
+              {
+                runEffectWorker: false,
+                databaseLayer,
+                recoverOnStartup: options.recoverOnStartup ?? false,
+              },
+            );
+            const management = ThreadManagementService.layer.pipe(Layer.provide(runtime));
+            const scheduled = ScheduledTaskService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  databaseLayer,
+                  management,
+                  NodeCrypto.layer,
+                  Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+                    launch: () => Effect.die("bound task only"),
                   }),
-              ...(options.recoverOnStartup === true ? { recoverOnStartup: true } : {}),
-            },
-          ),
+                  Layer.mock(SecretRequests.SecretRequests)({}),
+                  Layer.succeed(
+                    Scheduler.Scheduler,
+                    Scheduler.Scheduler.of({
+                      register: <E, R>(_name: string, run: Effect.Effect<void, E, R>) =>
+                        Effect.context<R>().pipe(
+                          Effect.andThen((context) =>
+                            Effect.sync(() => {
+                              pollScheduled = run.pipe(
+                                Effect.provideContext(context),
+                                Effect.orDie,
+                              );
+                            }),
+                          ),
+                        ),
+                    }),
+                  ),
+                ),
+              ),
+            );
+            return Layer.mergeAll(
+              runtime,
+              databaseLayer,
+              ThreadCommandExecutor.layer,
+              management,
+              scheduled,
+            );
+          })(),
         ),
       );
     }),
@@ -327,10 +401,8 @@ it.effect("F2-queue thread.stop holds a queued follow-up", () =>
   ),
 );
 
-// F2-send (the gap the design names): after Stop, a new message to the same thread.
-// This case records what the current source does; it does not assert a refusal,
-// because no goal-level hold exists yet. A start here is the finding.
-it.effect("F2-send a new message to a stopped thread is recorded, not assumed refused", () =>
+// F2-send: Stop alone is still the negative control; only an explicit goal hold refuses.
+it.effect("F2-send goal hold refuses a stopped idle thread and Resume starts work", () =>
   withHarness("stop-f2s", ({ orchestrator, worker, threadId, observe, send }) =>
     Effect.gen(function* () {
       const running = yield* waitForRunning(orchestrator);
@@ -343,13 +415,49 @@ it.effect("F2-send a new message to a stopped thread is recorded, not assumed re
         threadId,
       });
       yield* worker.drain();
-      yield* send("after-stop", "start_immediately");
+      // No goal hold: a new send really reaches the provider.
+      yield* send("control-after-stop", "start_immediately");
       yield* worker.drain();
-      const after = yield* observe("F2-send-after-stop");
-      const started = after.stubStarts > 1;
-      report(started ? "GAP-send-after-stop-starts-a-turn" : "PASS-send-after-stop-refused", after);
-      // Pins the observation, so a source change that adds a hold turns this red on purpose.
-      assert.equal(started, true, JSON.stringify(after));
+      assert.equal((yield* observe("F2-send-no-hold")).stubStarts, 2);
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("stop-control-f2s"),
+        threadId,
+      });
+      yield* worker.drain();
+      yield* orchestrator.dispatch({
+        type: "goal.hold",
+        commandId: CommandId.make("hold-f2s"),
+        threadId,
+        hold: "leo-stop",
+      });
+      const refused = yield* Effect.result(
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("held-send-f2s"),
+          threadId,
+          messageId: MessageId.make("held-message-f2s"),
+          text: "resume please",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        }),
+      );
+      assert.equal(refused._tag, "Failure");
+      if (refused._tag === "Failure") assert.equal(refused.failure._tag, "GoalDispatchHeldError");
+      yield* worker.drain();
+      const after = yield* observe("F2-send-held");
+      report("PASS-goal-hold-refuses-send", after);
+      assert.equal(after.stubStarts, 2);
+      yield* orchestrator.dispatch({
+        type: "goal.resume",
+        commandId: CommandId.make("resume-f2s"),
+        threadId,
+      });
+      yield* send("after-explicit-resume", "start_immediately");
+      yield* worker.drain();
+      assert.equal((yield* observe("F2-send-resumed")).stubStarts, 3);
     }),
   ),
 );
@@ -487,3 +595,539 @@ it.effect("F5 restart while stopped starts nothing until an explicit resume", ()
     );
   });
 });
+
+const messageCommand = (threadId: ThreadId, id: string) => ({
+  type: "message.dispatch" as const,
+  commandId: CommandId.make(id),
+  threadId,
+  messageId: MessageId.make(`message:${id}`),
+  text: id,
+  attachments: [],
+  dispatchMode: { type: "start_immediately" as const },
+  createdBy: "user" as const,
+  creationSource: "web" as const,
+});
+
+it.effect("F2-delegate root hold covers existing and future delegated descendants", () =>
+  withHarness("goal-delegate", ({ orchestrator, worker, stub, threadId, send }) =>
+    Effect.gen(function* () {
+      const running = yield* waitForRunning(orchestrator);
+      yield* send("parent", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const delegate = (id: string) =>
+        orchestrator.dispatch({
+          type: "delegated_task.request",
+          commandId: CommandId.make(id),
+          parentThreadId: threadId,
+          parentRunId: parent.id,
+          parentNodeId: parent.rootNodeId!,
+          task: "bounded stub child",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+      yield* orchestrator.dispatch({
+        type: "goal.hold",
+        commandId: CommandId.make("hold-delegate"),
+        threadId,
+        hold: "tree-stop",
+      });
+      const refused = yield* Effect.result(delegate("held-delegate"));
+      assert.equal(refused._tag, "Failure");
+      if (refused._tag === "Failure") assert.equal(refused.failure._tag, "GoalDispatchHeldError");
+      yield* worker.drain();
+      assert.equal(stub.started.length, 1);
+      yield* orchestrator.dispatch({
+        type: "goal.resume",
+        commandId: CommandId.make("resume-delegate"),
+        threadId,
+      });
+      yield* delegate("control-delegate");
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+      const child = (yield* orchestrator.getThreadProjection(threadId)).subagents[0]!
+        .childThreadId!;
+      yield* orchestrator.dispatch({
+        type: "goal.hold",
+        commandId: CommandId.make("hold-descendant"),
+        threadId,
+        hold: "ancestor-stop",
+      });
+      const childSend = yield* Effect.result(
+        orchestrator.dispatch(messageCommand(child, "held-child-send")),
+      );
+      assert.equal(childSend._tag, "Failure");
+      if (childSend._tag === "Failure") {
+        assert.equal(childSend.failure._tag, "GoalDispatchHeldError");
+        if (childSend.failure._tag === "GoalDispatchHeldError")
+          assert.equal(childSend.failure.goalThreadId, threadId);
+      }
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+    }),
+  ),
+);
+
+it.effect("F4 a hold queued before dispatch wins the root dispatch lock race", () =>
+  withHarness("goal-race", ({ orchestrator, worker, stub, threadId, executor, send }) =>
+    Effect.gen(function* () {
+      const running = yield* waitForRunning(orchestrator);
+      yield* send("race-parent", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("race-child"),
+        parentThreadId: threadId,
+        parentRunId: parent.id,
+        parentNodeId: parent.rootNodeId!,
+        task: "race child",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      yield* worker.drain();
+      const child = (yield* orchestrator.getThreadProjection(threadId)).subagents[0]!
+        .childThreadId!;
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("race-child-stop"),
+        threadId: child,
+      });
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+      const acquired = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const gate = yield* executor
+        .withLock(
+          threadId,
+          Deferred.succeed(acquired, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(acquired);
+      const hold = yield* orchestrator
+        .dispatch({
+          type: "goal.hold",
+          commandId: CommandId.make("race-hold"),
+          threadId,
+          hold: "race-stop",
+        })
+        .pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      const pendingSend = yield* Effect.result(
+        orchestrator.dispatch(messageCommand(child, "race-send")),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(gate);
+      yield* Fiber.join(hold);
+      const result = yield* Fiber.join(pendingSend);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure._tag, "GoalDispatchHeldError");
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+      yield* orchestrator.dispatch({
+        type: "goal.resume",
+        commandId: CommandId.make("race-resume"),
+        threadId,
+      });
+      yield* orchestrator.dispatch(messageCommand(child, "race-control"));
+      yield* worker.drain();
+      assert.equal(stub.started.length, 3);
+    }),
+  ),
+);
+
+it.effect(
+  "B1-B2 budget counts committed requests and refuses children and failed-run retries",
+  () =>
+    withHarness("goal-budget", ({ orchestrator, worker, stub, threadId, send }) =>
+      Effect.gen(function* () {
+        yield* orchestrator.dispatch({
+          type: "goal.budget.set",
+          commandId: CommandId.make("budget-1"),
+          threadId,
+          limit: 1,
+        });
+        const running = yield* waitForRunning(orchestrator);
+        yield* send("budget-first", "start_immediately");
+        yield* worker.drain();
+        yield* Fiber.join(running);
+        assert.equal(stub.started.length, 1);
+        // Receipt replay must not count a second request.
+        yield* send("budget-first", "start_immediately");
+        const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+        const child = yield* Effect.result(
+          orchestrator.dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make("budget-child"),
+            parentThreadId: threadId,
+            parentRunId: parent.id,
+            parentNodeId: parent.rootNodeId!,
+            task: "budget child",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdBy: "agent",
+            creationSource: "mcp",
+          }),
+        );
+        assert.equal(child._tag, "Failure");
+        if (child._tag === "Failure") assert.equal(child.failure._tag, "GoalDispatchBudgetError");
+        yield* endStubTurn(orchestrator, stub, threadId, "failed");
+        assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[0]!.status, "failed");
+        const second = yield* Effect.result(
+          orchestrator.dispatch(messageCommand(threadId, "budget-second")),
+        );
+        assert.equal(second._tag, "Failure");
+        if (second._tag === "Failure") assert.equal(second.failure._tag, "GoalDispatchBudgetError");
+        yield* worker.drain();
+        assert.equal(stub.started.length, 1);
+        const granted = yield* orchestrator.dispatch({
+          type: "goal.budget.set",
+          commandId: CommandId.make("budget-granted"),
+          threadId,
+          limit: 2,
+          grant: "leo-approval-1",
+        });
+        assert.ok(
+          granted.storedEvents.some(
+            (stored) =>
+              stored.event.type === "goal.dispatch-policy.updated" &&
+              stored.event.payload.grant === "leo-approval-1",
+          ),
+        );
+        yield* orchestrator.dispatch(messageCommand(threadId, "budget-control"));
+        yield* worker.drain();
+        assert.equal(stub.started.length, 2);
+        const third = yield* Effect.result(
+          orchestrator.dispatch(messageCommand(threadId, "budget-third")),
+        );
+        assert.equal(third._tag, "Failure");
+      }),
+    ),
+);
+
+it.effect("F2-scheduled records held fire as failed and advances its next due time", () =>
+  withHarness(
+    "goal-schedule",
+    ({ orchestrator, worker, stub, threadId, sql, scheduled, pollScheduled }) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const iso = DateTime.formatIso(now);
+        const taskId = ScheduledTaskId.make("goal-held-schedule");
+        yield* sql`INSERT INTO scheduled_tasks ${sql.insert({
+          task_id: taskId,
+          title: "held task",
+          prompt: "scheduled stub",
+          enabled: 1,
+          schedule_json: '{"type":"interval","everyMs":60000}',
+          project_id: "project:goal-schedule",
+          thread_id: threadId,
+          workspace_strategy_json: '{"type":"root"}',
+          model_selection_json: JSON.stringify(modelSelection),
+          runtime_mode: "full-access",
+          interaction_mode: "default",
+          created_by: "user",
+          creation_source: "web",
+          created_at: iso,
+          updated_at: iso,
+          next_run_at: iso,
+          last_run_at: null,
+          last_run_status: "never",
+          last_run_error: null,
+          run_count: 0,
+        })}`;
+        yield* orchestrator.dispatch({
+          type: "goal.hold",
+          commandId: CommandId.make("schedule-hold"),
+          threadId,
+          hold: "scheduled-stop",
+        });
+        yield* pollScheduled;
+        yield* worker.drain();
+        const rows = yield* sql<{
+          last_run_status: string;
+          last_run_error: string;
+          run_count: number;
+          next_run_at: string;
+        }>`SELECT * FROM scheduled_tasks WHERE task_id = ${taskId}`;
+        assert.equal(rows[0]!.last_run_status, "failed");
+        assert.ok(rows[0]!.last_run_error.includes("scheduled-stop"));
+        assert.equal(rows[0]!.run_count, 1);
+        assert.ok(Date.parse(rows[0]!.next_run_at) > DateTime.toEpochMillis(now));
+        assert.equal(stub.started.length, 0);
+        yield* pollScheduled;
+        const repeated = yield* sql<{
+          run_count: number;
+        }>`SELECT run_count FROM scheduled_tasks WHERE task_id = ${taskId}`;
+        assert.equal(repeated[0]!.run_count, 1);
+        yield* orchestrator.dispatch({
+          type: "goal.resume",
+          commandId: CommandId.make("schedule-resume"),
+          threadId,
+        });
+        yield* scheduled.runNow({ id: taskId });
+        yield* worker.drain();
+        assert.equal(stub.started.length, 1);
+      }),
+  ),
+);
+
+const endStubTurn = (
+  orchestrator: Orchestrator.OrchestratorV2Shape,
+  stub: Stub,
+  threadId: ThreadId,
+  status: "completed" | "failed",
+) =>
+  Effect.gen(function* () {
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    const providerTurn = projection.providerTurns.at(-1)!;
+    const now = yield* DateTime.now;
+    const ended = yield* orchestrator.streamDomainEvents.pipe(
+      Stream.filter(
+        (event) =>
+          event.type === "run.updated" &&
+          event.threadId === threadId &&
+          !["running", "queued", "starting"].includes(event.payload.status),
+      ),
+      Stream.take(1),
+      Stream.runDrain,
+      Effect.forkScoped,
+    );
+    yield* Queue.offer(stub.events, {
+      type: "provider_turn.updated",
+      driver,
+      providerTurn: { ...providerTurn, status, completedAt: now },
+    });
+    yield* Queue.offer(stub.events, {
+      type: "turn.terminal",
+      driver,
+      providerThreadId: providerTurn.providerThreadId,
+      providerTurnId: providerTurn.id,
+      runOrdinal: stub.started.at(-1)!.runOrdinal,
+      threadDisposition: "reusable",
+      ...(status === "failed"
+        ? {
+            status,
+            failure: makeProviderFailure({ class: "validation_error", message: "stub failure" }),
+            failureItemOrdinal: 1,
+          }
+        : { status, failure: null }),
+    });
+    yield* Fiber.join(ended);
+  });
+
+it.effect("F2-queue-goal hold refuses queue release without failing or unholding queued work", () =>
+  withHarness("goal-queue", ({ orchestrator, worker, stub, threadId, send }) =>
+    Effect.gen(function* () {
+      const running = yield* waitForRunning(orchestrator);
+      yield* send("queue-first", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      yield* send("queue-second", "queue_after_active");
+      yield* orchestrator.dispatch({
+        type: "goal.hold",
+        commandId: CommandId.make("queue-goal-hold"),
+        threadId,
+        hold: "queue-goal-stop",
+      });
+      yield* endStubTurn(orchestrator, stub, threadId, "completed");
+      yield* orchestrator.resumeQueuedRuns;
+      yield* worker.drain();
+      assert.equal(stub.started.length, 1);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!.status,
+        "queued",
+      );
+      const release = yield* Effect.result(
+        orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make("queue-held-release"),
+          threadId,
+        }),
+      );
+      assert.equal(release._tag, "Failure");
+      if (release._tag === "Failure") assert.equal(release.failure._tag, "GoalDispatchHeldError");
+      yield* orchestrator.dispatch({
+        type: "goal.resume",
+        commandId: CommandId.make("queue-goal-resume"),
+        threadId,
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("queue-control-release"),
+        threadId,
+      });
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+    }),
+  ),
+);
+
+it.effect("B1 tree budget includes child starts in the root total", () =>
+  withHarness("goal-tree-budget", ({ orchestrator, worker, stub, threadId, send }) =>
+    Effect.gen(function* () {
+      yield* orchestrator.dispatch({
+        type: "goal.budget.set",
+        commandId: CommandId.make("tree-budget"),
+        threadId,
+        limit: 2,
+      });
+      const running = yield* waitForRunning(orchestrator);
+      yield* send("tree-parent", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("tree-child"),
+        parentThreadId: threadId,
+        parentRunId: parent.id,
+        parentNodeId: parent.rootNodeId!,
+        task: "tree child",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+      const child = (yield* orchestrator.getThreadProjection(threadId)).subagents[0]!
+        .childThreadId!;
+      for (const target of [threadId, child]) {
+        const refused = yield* Effect.result(
+          orchestrator.dispatch(messageCommand(target, `tree-exhausted:${target}`)),
+        );
+        assert.equal(refused._tag, "Failure");
+        if (refused._tag === "Failure")
+          assert.equal(refused.failure._tag, "GoalDispatchBudgetError");
+      }
+      yield* worker.drain();
+      assert.equal(stub.started.length, 2);
+    }),
+  ),
+);
+
+it.effect("F5-goal policy survives a second runtime over the same SQLite file", () => {
+  const databasePath = NodePath.join(
+    NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "dg04-goal-")),
+    "orchestration.sqlite",
+  );
+  return Effect.gen(function* () {
+    yield* withHarness(
+      "goal-durable",
+      ({ orchestrator, worker, threadId, send }) =>
+        Effect.gen(function* () {
+          yield* orchestrator.dispatch({
+            type: "goal.budget.set",
+            commandId: CommandId.make("durable-budget"),
+            threadId,
+            limit: 1,
+          });
+          const running = yield* waitForRunning(orchestrator);
+          yield* send("durable-first", "start_immediately");
+          yield* worker.drain();
+          yield* Fiber.join(running);
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("durable-stop"),
+            threadId,
+          });
+          yield* worker.drain();
+          yield* orchestrator.dispatch({
+            type: "goal.hold",
+            commandId: CommandId.make("durable-hold"),
+            threadId,
+            hold: "persisted-stop",
+          });
+        }),
+      { databasePath, layerName: "goal-durable-a" },
+    );
+    yield* withHarness(
+      "goal-durable",
+      ({ orchestrator, worker, stub, threadId }) =>
+        Effect.gen(function* () {
+          const held = yield* Effect.result(
+            orchestrator.dispatch(messageCommand(threadId, "durable-held-send")),
+          );
+          assert.equal(held._tag, "Failure");
+          if (held._tag === "Failure") assert.equal(held.failure._tag, "GoalDispatchHeldError");
+          yield* orchestrator.dispatch({
+            type: "goal.resume",
+            commandId: CommandId.make("durable-resume"),
+            threadId,
+          });
+          const exhausted = yield* Effect.result(
+            orchestrator.dispatch(messageCommand(threadId, "durable-budget-send")),
+          );
+          assert.equal(exhausted._tag, "Failure");
+          if (exhausted._tag === "Failure")
+            assert.equal(exhausted.failure._tag, "GoalDispatchBudgetError");
+          yield* worker.drain();
+          assert.equal(stub.started.length, 0);
+          // This proves persisted policy, not a whole-process restart or provider rebuild.
+        }),
+      { databasePath, layerName: "goal-durable-b", existingThread: true, recoverOnStartup: true },
+    );
+  });
+});
+
+it.effect(
+  "B3 budget increase requires a durable grant and leaves an ungranted limit unchanged",
+  () =>
+    withHarness("goal-grant", ({ orchestrator, worker, stub, threadId }) =>
+      Effect.gen(function* () {
+        yield* orchestrator.dispatch({
+          type: "goal.budget.set",
+          commandId: CommandId.make("grant-zero"),
+          threadId,
+          limit: 0,
+        });
+        const ungranted = yield* Effect.result(
+          orchestrator.dispatch({
+            type: "goal.budget.set",
+            commandId: CommandId.make("grant-missing"),
+            threadId,
+            limit: 1,
+          }),
+        );
+        assert.equal(ungranted._tag, "Failure");
+        if (ungranted._tag === "Failure")
+          assert.equal(ungranted.failure._tag, "GoalBudgetGrantRequiredError");
+        const unchanged = yield* Effect.result(
+          orchestrator.dispatch(messageCommand(threadId, "grant-still-zero")),
+        );
+        assert.equal(unchanged._tag, "Failure");
+        if (unchanged._tag === "Failure")
+          assert.equal(unchanged.failure._tag, "GoalDispatchBudgetError");
+        yield* worker.drain();
+        assert.equal(stub.started.length, 0);
+        const granted = yield* orchestrator.dispatch({
+          type: "goal.budget.set",
+          commandId: CommandId.make("grant-recorded"),
+          threadId,
+          limit: 1,
+          grant: "leo-grant-ref",
+        });
+        assert.ok(
+          granted.storedEvents.some(
+            (stored) =>
+              stored.event.type === "goal.dispatch-policy.updated" &&
+              stored.event.payload.grant === "leo-grant-ref",
+          ),
+        );
+        yield* orchestrator.dispatch(messageCommand(threadId, "grant-control"));
+        yield* worker.drain();
+        assert.equal(stub.started.length, 1);
+      }),
+    ),
+);

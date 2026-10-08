@@ -37,6 +37,7 @@ import {
   type OrchestrationV2DelegatedCompletionCohort,
   type OrchestrationV2DelegatedCompletionDelivery,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2GoalDispatchPolicy,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -76,6 +77,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import * as GoalHold from "./GoalHold.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import {
   isCheckpointRestoreIsolated,
@@ -88,6 +90,7 @@ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "./Notification.ts";
 import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
+import { EventStoreV2 } from "./EventStore.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
@@ -262,6 +265,9 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorCommandIdConflictError,
   OrchestratorSubagentThreadReadOnlyError,
   OrchestratorThreadAboveModeLimitError,
+  GoalHold.GoalDispatchHeldError,
+  GoalHold.GoalDispatchBudgetError,
+  GoalHold.GoalBudgetGrantRequiredError,
 ]);
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
 
@@ -462,6 +468,9 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "prepared-run.retry":
     case "run.interrupt":
     case "queued-message.promote-to-steer":
+    case "goal.hold":
+    case "goal.resume":
+    case "goal.budget.set":
     case "queue.resume":
     case "queued-run.reorder":
     case "queued-run.cancel":
@@ -799,6 +808,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const commandPolicy = yield* CommandPolicyV2;
   const contextHandoffService = yield* ContextHandoffServiceV2;
   const eventSink = yield* EventSinkV2;
+  const eventStore = yield* EventStoreV2;
   const commandReceipts = yield* CommandReceiptStoreV2;
   const idAllocator = yield* IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
@@ -829,6 +839,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+
+  // Lineage is immutable after creation. Descendant commands take the root lock
+  // before their own lock, so a root hold/grant and every reservation serialize.
+  const goalThreadId = (threadId: ThreadId) =>
+    projectionStore.getThreadShell(threadId).pipe(
+      Effect.map((thread) => thread?.lineage.rootThreadId ?? threadId),
+      Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+    );
+
+  const withGoalDispatchLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const root = yield* goalThreadId(threadId);
+      return yield* threadDispatch.withLock(
+        root,
+        root === threadId ? effect : threadDispatch.withLock(threadId, effect),
+      );
+    });
+
+  const readGoalPolicy = (root: ThreadId) =>
+    eventStore
+      .read({
+        threadId: root,
+        eventType: "goal.dispatch-policy.updated",
+      })
+      .pipe(
+        Stream.runFold(
+          (): OrchestrationV2GoalDispatchPolicy => GoalHold.emptyPolicy,
+          (policy, stored) =>
+            stored.event.type === "goal.dispatch-policy.updated" ? stored.event.payload : policy,
+        ),
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId: root, cause })),
+      );
+
+  const checkGoalDispatch = (threadId: ThreadId, requests = 1, pendingRoot?: ThreadId) =>
+    Effect.gen(function* () {
+      const root = pendingRoot ?? (yield* goalThreadId(threadId));
+      const policy = yield* readGoalPolicy(root);
+      const refused = GoalHold.refusal(policy, threadId, root, requests);
+      if (refused !== undefined) return yield* refused;
+      return { root, policy };
+    });
+
+  const isProviderDispatch = (effect: PendingOrchestrationEffectV2) =>
+    effect.request.type === "provider-turn.start" ||
+    effect.request.type === "provider-turn.restart" ||
+    effect.request.type === "provider-turn.steer";
 
   const mapDispatchError =
     (command: OrchestrationV2ServerCommand) =>
@@ -1014,6 +1070,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const withIds = yield* Effect.forEach(events, (event) =>
         makeSystemEvent(event as Omit<OrchestrationV2DomainEvent, "id">),
       );
+      const requestCount = effects.filter(isProviderDispatch).length;
+      if (requestCount > 0) {
+        const threadId = effects.find(isProviderDispatch)!.threadId;
+        const { root, policy } = yield* checkGoalDispatch(threadId, requestCount);
+        withIds.push(
+          yield* makeSystemEvent({
+            type: "goal.dispatch-policy.updated",
+            threadId: root,
+            occurredAt: yield* DateTime.now,
+            payload: { ...policy, used: policy.used + requestCount },
+          }),
+        );
+      }
       yield* eventSink.writeWithEffects({ events: withIds, effects });
     });
 
@@ -1294,6 +1363,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (queuedRun === undefined) {
         return;
       }
+      yield* checkGoalDispatch(threadId);
       // A provider that just failed will likely fail the next message too.
       // Hold the queue so the user decides when to resume it. Validation
       // failures (setup, unsupported handoff) belong to that message alone,
@@ -1867,7 +1937,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         ],
       );
-    }).pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause)));
+    }).pipe(
+      Effect.catch((cause) =>
+        cause._tag === "GoalDispatchHeldError" || cause._tag === "GoalDispatchBudgetError"
+          ? Effect.fail(cause)
+          : failQueuedRunStart(threadId, cause),
+      ),
+    );
 
   const resumeQueuedRuns = Effect.gen(function* () {
     const threadIds = yield* projectionStore.getRecoveryThreadIds("queued-runs");
@@ -1875,7 +1951,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     for (const threadId of threadIds) {
       const resumedThread = yield* Effect.gen(function* () {
         if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
-        yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
+        yield* withGoalDispatchLock(threadId, startNextQueuedRun(threadId));
         return true;
       }).pipe(
         Effect.catch((cause) =>
@@ -4465,6 +4541,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) =>
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      // Internal notifications and user-input replies also enter here. A
+      // delegated child may exist only in this command's pending events.
+      yield* checkGoalDispatch(command.threadId, 1, projection.thread.lineage.rootThreadId);
       if (command.manualContinuationOfRunId !== undefined) {
         const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
         const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -10148,6 +10227,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       | undefined;
     switch (command.type) {
+      case "goal.hold":
+      case "goal.resume":
+      case "goal.budget.set": {
+        const root = yield* goalThreadId(command.threadId);
+        if (root !== command.threadId) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Goal controls must target root thread ${root}.`,
+          });
+        }
+        yield* loadProjectionForCommand(command, []);
+        const policy = yield* readGoalPolicy(root);
+        if (
+          command.type === "goal.budget.set" &&
+          policy.limit !== null &&
+          command.limit > policy.limit &&
+          !command.grant?.trim()
+        ) {
+          return yield* new GoalHold.GoalBudgetGrantRequiredError({
+            goalThreadId: root,
+            limit: command.limit,
+          });
+        }
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "goal.dispatch-policy.updated",
+          threadId: root,
+          occurredAt: yield* DateTime.now,
+          payload:
+            command.type === "goal.hold"
+              ? { ...policy, hold: command.hold }
+              : command.type === "goal.resume"
+                ? { ...policy, hold: null }
+                : { ...policy, limit: command.limit, grant: command.grant ?? policy.grant },
+        });
+        break;
+      }
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
         break;
@@ -10480,6 +10599,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       } satisfies OrchestratorV2DispatchResult;
     }
 
+    if (
+      [
+        "message.dispatch",
+        "delegated_task.request",
+        "queue.resume",
+        "queued-message.promote-to-steer",
+        "prepared-run.release",
+        "prepared-run.retry",
+      ].includes(command.type)
+    ) {
+      yield* checkGoalDispatch(commandThreadId(command));
+    }
+
     // A limited sender checked these modes before dispatching; the thread's
     // user may have raised them since, and only here can they not change.
     const limit = yield* DispatchModeLimit;
@@ -10577,14 +10709,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       return { sequence: resultSequence, storedEvents: [] } satisfies OrchestratorV2DispatchResult;
     }
-    const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    let commitEvents = plan.events;
+    const requestCount = plan.effects.filter(isProviderDispatch).length;
+    if (requestCount > 0) {
+      const { root, policy } = yield* checkGoalDispatch(commandThreadId(command), requestCount);
+      const counted = yield* mapDispatchError(command)(
+        makeSystemEvent({
+          type: "goal.dispatch-policy.updated",
+          threadId: root,
+          occurredAt: yield* DateTime.now,
+          payload: { ...policy, used: policy.used + requestCount },
+        }),
+      );
+      // The reservation and outbox requests commit together; a failed commit
+      // cannot spend a turn, and replaying a receipt cannot spend it twice.
+      commitEvents = [...plan.events, counted];
+    }
+    const acceptedAt = commitEvents.at(-1)?.occurredAt ?? (yield* DateTime.now);
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
         threadId: commandThreadId(command),
         commandType: command.type,
         acceptedAt,
-        events: plan.events,
+        events: commitEvents,
         effects: plan.effects,
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
@@ -10625,7 +10773,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
-    threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command));
+    withGoalDispatchLock(commandThreadId(command), dispatchWithReceiptEffect(command));
 
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
@@ -10642,21 +10790,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           finalizeDelegatedCompletionDelivery(threadId, stored.event.payload.id),
         );
       }
-      yield* threadDispatch
-        .withLock(
+      yield* withGoalDispatchLock(
+        threadId,
+        startNextQueuedRun(
           threadId,
-          startNextQueuedRun(
-            threadId,
-            stored.event.type === "run.updated" && stored.event.payload.status === "failed"
-              ? { failedRunId: stored.event.payload.id }
-              : undefined,
-          ),
-        )
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
-          ),
-        );
+          stored.event.type === "run.updated" && stored.event.payload.status === "failed"
+            ? { failedRunId: stored.event.payload.id }
+            : undefined,
+        ),
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
+        ),
+      );
       // After the queue decision: a provider failure holds the child's queued
       // wakes, and only then is the failed run the task's result.
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
@@ -10955,6 +11101,7 @@ export const layer: Layer.Layer<
   | ContextHandoffServiceV2
   | EffectOutbox.EffectOutboxV2
   | EventSinkV2
+  | EventStoreV2
   | IdAllocatorV2
   | ProjectStore.ProjectStoreV2
   | ProviderAdapterRegistryV2

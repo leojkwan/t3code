@@ -1640,7 +1640,21 @@ const OrchestrationV2EventBase = Schema.Struct({
   occurredAt: Schema.DateTimeUtc,
 });
 
+/** Root-owned dispatch policy. Usage counts committed provider start/restart/steer requests. */
+export const OrchestrationV2GoalDispatchPolicy = Schema.Struct({
+  hold: Schema.NullOr(TrimmedNonEmptyString),
+  limit: Schema.NullOr(NonNegativeInt),
+  used: NonNegativeInt,
+  grant: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type OrchestrationV2GoalDispatchPolicy = typeof OrchestrationV2GoalDispatchPolicy.Type;
+
 export const OrchestrationV2DomainEvent = Schema.Union([
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("goal.dispatch-policy.updated"),
+    payload: OrchestrationV2GoalDispatchPolicy,
+  }),
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("thread.created"),
@@ -2462,6 +2476,11 @@ export type OrchestrationV2RawProviderEventJson = typeof OrchestrationV2RawProvi
 export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("goal.dispatch-policy.updated"),
+    payload: OrchestrationV2GoalDispatchPolicy,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("thread.created"),
     payload: OrchestrationV2AppThreadJson,
   }),
@@ -2924,6 +2943,24 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     queuedRunId: RunId,
     targetRunId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.hold"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    hold: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.resume"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("goal.budget.set"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    limit: NonNegativeInt,
+    grant: Schema.optional(TrimmedNonEmptyString),
   }),
   Schema.Struct({
     type: Schema.Literal("queue.resume"),
