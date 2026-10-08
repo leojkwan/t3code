@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
+  ScheduledTaskId,
   type ModelSelection,
   NodeId,
   type OrchestrationV2AppThread,
@@ -1486,6 +1487,19 @@ it.effect("refuses provider spoofing of app-owned consultation answers before pe
       replyTo: message.replyTo,
     };
     for (const event of [
+      {
+        type: "message.updated" as const,
+        driver: CODEX_DRIVER,
+        message: {
+          ...message,
+          id: MessageId.make("message:nonreserved-provider-input"),
+          role: "user" as const,
+          scheduledTaskId: ScheduledTaskId.make("signed-native-hook"),
+          appOwned: undefined,
+          replyTo: undefined,
+          sourceEventId: undefined,
+        },
+      },
       { type: "message.updated" as const, driver: CODEX_DRIVER, message },
       { type: "turn_item.updated" as const, driver: CODEX_DRIVER, turnItem: item },
       {

@@ -401,7 +401,13 @@ export const layer: Layer.Layer<
           );
         if (
           candidate !== undefined &&
-          (("appOwned" in candidate && candidate.appOwned !== undefined) ||
+          (("scheduledTaskId" in candidate &&
+            candidate.scheduledTaskId !== undefined &&
+            "createdBy" in candidate &&
+            candidate.createdBy === "agent" &&
+            "creationSource" in candidate &&
+            candidate.creationSource === "server") ||
+            ("appOwned" in candidate && candidate.appOwned !== undefined) ||
             ("replyTo" in candidate && candidate.replyTo !== undefined) ||
             ("sourceEventId" in candidate && candidate.sourceEventId !== undefined) ||
             reserved(candidate.id) ||
