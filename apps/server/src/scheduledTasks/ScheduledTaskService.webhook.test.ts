@@ -9,15 +9,18 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  OrchestratorMcpThreadReadResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
   RuntimeRequestId,
+  ScheduledTaskId,
   ScheduledTaskUpsertInput,
   SecretRequestError,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -25,6 +28,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as EffectScheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
@@ -36,6 +40,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
+import * as ProviderRegistryMock from "../provider/testUtils/providerRegistryMock.ts";
+import * as ProjectService from "../project/ProjectService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
@@ -102,6 +109,8 @@ const withNativeFeedback = <A, E, R>(
     worker: EffectWorker.OrchestrationEffectWorkerV2["Service"];
     started: ProviderAdapterV2TurnInput[];
     steered: ProviderAdapterV2SteerInput[];
+    providerEvents: Queue.Queue<ProviderAdapterV2Event>;
+    readThread: () => Effect.Effect<typeof OrchestratorMcpThreadReadResult.Type>;
   }) => Effect.Effect<A, E, R>,
   options: {
     startHuman?: boolean;
@@ -208,11 +217,12 @@ const withNativeFeedback = <A, E, R>(
           : SqlitePersistence.layerFromPath(options.databasePath).pipe(
               Layer.provide(NodeServices.layer),
             );
+      const registry = ProviderAdapterRegistry.layerFromAdapters([adapter]);
       const native = Layer.mergeAll(
         database,
         ProviderReplayHarness.layerWithRegistry(
           { name: "agent-feedback", runtimePolicyOverride: { cwd } },
-          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          registry,
           { databaseLayer: database, runEffectWorker: false },
         ),
       );
@@ -282,12 +292,62 @@ const withNativeFeedback = <A, E, R>(
           ),
         ),
       );
+      const readbackLayer = OrchestratorMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            native,
+            management,
+            serviceLayer,
+            registry,
+            NodePlatformCrypto.layer,
+            ProviderRegistryMock.layer([]),
+            Layer.mock(ProjectService.ProjectService)({
+              getById: () => Effect.succeed(Option.none()),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+          ),
+        ),
+      );
       return yield* Effect.gen(function* () {
         const service = yield* ScheduledTaskService.ScheduledTaskService;
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const readThread = () =>
+          mcp
+            .readThread(
+              {
+                environmentId: EnvironmentId.make("environment:feedback"),
+                requestNamespace: "provider:feedback",
+                thread: {
+                  threadId: feedbackOwner,
+                  providerSessionId: "provider:feedback",
+                  providerInstanceId: instanceId,
+                },
+                client: undefined,
+                capabilities: new Set(["orchestration"]),
+                issuedAt: 1,
+              },
+              { threadId: feedbackOwner, view: "messages", limit: 100, maxCharsPerItem: 32000 },
+            )
+            .pipe(
+              Effect.flatMap((result) =>
+                Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult)(
+                  JSON.parse(JSON.stringify(result)),
+                ),
+              ),
+              Effect.orDie,
+            );
         if (options.existingOwner === true)
-          return yield* body({ service, orchestrator, worker, started, steered });
+          return yield* body({
+            service,
+            orchestrator,
+            worker,
+            started,
+            steered,
+            providerEvents: events,
+            readThread,
+          });
         yield* orchestrator.dispatch({
           type: "thread.create",
           commandId: CommandId.make("feedback:create"),
@@ -332,8 +392,16 @@ const withNativeFeedback = <A, E, R>(
           yield* worker.drain();
           yield* Fiber.join(running);
         }
-        return yield* body({ service, orchestrator, worker, started, steered });
-      }).pipe(Effect.provide(Layer.mergeAll(native, serviceLayer)));
+        return yield* body({
+          service,
+          orchestrator,
+          worker,
+          started,
+          steered,
+          providerEvents: events,
+          readThread,
+        });
+      }).pipe(Effect.provide(Layer.mergeAll(native, serviceLayer, readbackLayer)));
     }),
   );
 
@@ -397,6 +465,25 @@ it.effect(
         const before = yield* orchestrator.getThreadProjection(feedbackOwner);
         const first = yield* service.triggerWebhook(feedbackRequest(task, consultationEnvelope()));
         assert.equal(first._tag, "accepted");
+        const repeat = yield* Effect.result(
+          service.triggerWebhook(
+            feedbackRequest(
+              task,
+              consultationEnvelope({
+                eventId: "slack:C_PRODUCT:1791359017.942709",
+                origin: "https://workspace.slack.com/archives/C_PRODUCT/p1791359017942709",
+              }),
+            ),
+          ),
+        );
+        assert.equal(repeat._tag, "Failure");
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(feedbackOwner)).messages.filter(
+            (m) => m.scheduledTaskId != null,
+          ).length,
+          1,
+          "Direct per-peer refusal must precede the shared max-two cap",
+        );
         const second = yield* service.triggerWebhook(
           feedbackRequest(
             task,
@@ -551,9 +638,15 @@ it.effect(
   () =>
     withNativeFeedback(({ service, orchestrator }) =>
       Effect.gen(function* () {
-        const { task: legacy } = yield* service.upsert(yield* nativeFeedbackTask());
+        const { task: legacy } = yield* service.upsert({
+          ...(yield* nativeFeedbackTask()),
+          id: ScheduledTaskId.make("scheduled-task:legacy-hook"),
+        });
         yield* service.triggerWebhook(feedbackRequest(legacy));
-        const { task: direct } = yield* service.upsert(yield* nativeConsultationTask());
+        const { task: direct } = yield* service.upsert({
+          ...(yield* nativeConsultationTask()),
+          id: ScheduledTaskId.make("scheduled-task:direct-hook"),
+        });
         yield* service.triggerWebhook(
           feedbackRequest(
             direct,
@@ -563,7 +656,11 @@ it.effect(
             }),
           ),
         );
-        const { task: anotherHook } = yield* service.upsert(yield* nativeConsultationTask());
+        const { task: anotherHook } = yield* service.upsert({
+          ...(yield* nativeConsultationTask()),
+          id: ScheduledTaskId.make("scheduled-task:third-hook"),
+        });
+        assert.equal(new Set([legacy.id, direct.id, anotherHook.id]).size, 3);
         const refused = yield* Effect.result(
           service.triggerWebhook(
             feedbackRequest(
@@ -714,57 +811,138 @@ it.effect("an input-shaped record without its native admission receipt cannot co
   ),
 );
 
-it.effect("a failed sibling request cannot borrow an answered consultation or revive its run", () =>
-  withNativeFeedback(({ service, orchestrator }) =>
-    Effect.gen(function* () {
-      const { task } = yield* service.upsert(yield* nativeConsultationTask());
-      yield* service.triggerWebhook(feedbackRequest(task, consultationEnvelope()));
-      yield* service.triggerWebhook(
-        feedbackRequest(
-          task,
-          consultationEnvelope({
-            eventId: "slack:C_PRODUCT:1791359016.942709",
-            peerId: "U_HERMES",
-            peerBotId: "B_HERMES",
-            peerAppId: undefined,
-            origin: "https://workspace.slack.com/archives/C_PRODUCT/p1791359016942709",
-          }),
-        ),
-      );
-      const projection = yield* orchestrator.getThreadProjection(feedbackOwner);
-      const requests = projection.messages.filter((m) => m.scheduledTaskId === task.id);
-      const call = (requestMessageId: MessageId) =>
-        service.completeConsultation({
-          environmentId: EnvironmentId.make("environment:feedback"),
-          threadId: feedbackOwner,
-          providerInstanceId: ProviderInstanceId.make("codex"),
-          providerSessionId: "provider:feedback",
-          requestMessageId,
-          answer: "First peer's scoped answer.",
-        });
-      yield* call(requests[0]!.id);
-      const sink = yield* EventSink.EventSinkV2;
-      const now = yield* DateTime.now;
-      const run = projection.runs[0]!;
-      yield* sink.write({
-        events: [
-          {
-            id: EventId.make("consultation:failed-run"),
-            type: "run.updated",
-            threadId: feedbackOwner,
-            runId: run.id,
-            providerInstanceId: run.providerInstanceId,
-            occurredAt: now,
-            payload: { ...run, status: "failed", completedAt: now },
-          },
-        ],
-      });
-      assert.equal((yield* Effect.result(call(requests[1]!.id)))._tag, "Failure");
-      const after = yield* orchestrator.getThreadProjection(feedbackOwner);
-      assert.equal(after.messages.filter((m) => m.appOwned === "consultation").length, 1);
-      assert.equal(after.runs[0]?.status, "failed");
-    }),
-  ),
+it.effect(
+  "a failed or no-result sibling cannot borrow a scoped answer or ordinary provider final",
+  () =>
+    Effect.forEach(["failed", "completed"] as const, (status) =>
+      withNativeFeedback(({ service, orchestrator, providerEvents, readThread }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(yield* nativeConsultationTask());
+          yield* service.triggerWebhook(feedbackRequest(task, consultationEnvelope()));
+          yield* service.triggerWebhook(
+            feedbackRequest(
+              task,
+              consultationEnvelope({
+                eventId: "slack:C_PRODUCT:1791359016.942709",
+                peerId: "U_HERMES",
+                peerBotId: "B_HERMES",
+                peerAppId: undefined,
+                origin: "https://workspace.slack.com/archives/C_PRODUCT/p1791359016942709",
+              }),
+            ),
+          );
+          const projection = yield* orchestrator.getThreadProjection(feedbackOwner);
+          const requests = projection.messages.filter((m) => m.scheduledTaskId === task.id);
+          const call = (requestMessageId: MessageId) =>
+            service.completeConsultation({
+              environmentId: EnvironmentId.make("environment:feedback"),
+              threadId: feedbackOwner,
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              providerSessionId: "provider:feedback",
+              requestMessageId,
+              answer: "First peer's scoped answer.",
+            });
+          yield* call(requests[0]!.id);
+          const sink = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          const run = projection.runs[0]!;
+          const providerTurn = projection.providerTurns[0]!;
+          const finalMessageId = MessageId.make("message:ordinary-provider-final");
+          const finalItemId = TurnItemId.make("item:ordinary-provider-final");
+          const observed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) => event.type === "turn-item.updated" && event.payload.id === finalItemId,
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          // Fake external provider output enters through its actual session stream
+          // and normalizer; it must stay an unassociated ordinary provider final.
+          yield* Queue.offerAll(providerEvents, [
+            {
+              type: "message.updated",
+              driver: ProviderDriverKind.make("codex"),
+              message: {
+                ...requests[0]!,
+                id: finalMessageId,
+                role: "assistant",
+                text: "Ordinary provider final, unrelated to either peer answer.",
+                streaming: false,
+                createdBy: "agent",
+                creationSource: "provider",
+                scheduledTaskId: undefined,
+                senderThreadId: undefined,
+              },
+            },
+            {
+              type: "turn_item.updated",
+              driver: ProviderDriverKind.make("codex"),
+              turnItem: {
+                id: finalItemId,
+                type: "assistant_message",
+                threadId: feedbackOwner,
+                runId: run.id,
+                nodeId: run.rootNodeId,
+                providerThreadId: providerTurn.providerThreadId,
+                providerTurnId: providerTurn.id,
+                nativeItemRef: {
+                  driver: ProviderDriverKind.make("codex"),
+                  nativeId: "ordinary-provider-final",
+                  strength: "strong",
+                },
+                parentItemId: null,
+                ordinal: 999,
+                status: "completed",
+                title: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                messageId: finalMessageId,
+                text: "Ordinary provider final, unrelated to either peer answer.",
+                streaming: false,
+              },
+            },
+          ]);
+          yield* Fiber.join(observed);
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("consultation:failed-run"),
+                type: "run.updated",
+                threadId: feedbackOwner,
+                runId: run.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+                payload: { ...run, status, completedAt: now },
+              },
+            ],
+          });
+          assert.equal((yield* Effect.result(call(requests[1]!.id)))._tag, "Failure");
+          const after = yield* orchestrator.getThreadProjection(feedbackOwner);
+          assert.equal(after.messages.filter((m) => m.appOwned === "consultation").length, 1);
+          assert.equal(after.runs[0]?.status, status);
+          const timeline = yield* readThread();
+          assert.equal(
+            timeline.recentRuns.find((candidate) => candidate.runId === run.id)?.status,
+            status,
+          );
+          const answers = timeline.items.filter((item) => item.appOwned === "consultation");
+          assert.equal(answers.length, 1);
+          assert.equal(answers[0]!.replyTo?.messageId, requests[0]!.id);
+          assert.equal(answers[0]!.sourceEventId, consultationEnvelope().eventId);
+          assert.isFalse(
+            timeline.items.some((item) => item.replyTo?.messageId === requests[1]!.id),
+          );
+          const ordinary = timeline.items.find((item) => item.itemId === finalItemId)!;
+          assert.equal(ordinary.messageId, finalMessageId);
+          assert.equal(ordinary.creationSource, "provider");
+          assert.isUndefined(ordinary.appOwned);
+          assert.isUndefined(ordinary.replyTo);
+          assert.isUndefined(ordinary.sourceEventId);
+        }),
+      ),
+    ),
 );
 
 it.effect("exposes an application completion without dispatching another input", () =>
@@ -1041,6 +1219,95 @@ it.effect("retains one native acceptance when the transport crashes after commit
     },
   );
 });
+
+it.effect(
+  "retains a direct answer, native receipt and typed readback after recreating the runtime",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* Effect.acquireRelease(
+          fs.makeTempDirectory({ prefix: "t3-consultation-restart-" }),
+          (path) => fs.remove(path, { recursive: true }).pipe(Effect.orDie),
+        );
+        const databasePath = `${directory}/state.sqlite`;
+        const first = yield* withNativeFeedback(
+          ({ service, orchestrator, readThread }) =>
+            Effect.gen(function* () {
+              const { task } = yield* service.upsert(yield* nativeConsultationTask());
+              const admitted = yield* service.triggerWebhook(
+                feedbackRequest(task, consultationEnvelope()),
+              );
+              const request = (yield* orchestrator.getThreadProjection(
+                feedbackOwner,
+              )).messages.find((m) => m.scheduledTaskId === task.id)!;
+              const input = {
+                environmentId: EnvironmentId.make("environment:feedback"),
+                threadId: feedbackOwner,
+                providerInstanceId: ProviderInstanceId.make("codex"),
+                providerSessionId: "provider:feedback",
+                requestMessageId: request.id,
+                answer: "Retain this direct answer across native recreation.",
+              };
+              const completed = yield* service.completeConsultation(input);
+              const before = yield* orchestrator.getThreadProjection(feedbackOwner);
+              const timeline = yield* readThread();
+              const sql = yield* SqlClient.SqlClient;
+              const receipts =
+                yield* sql`SELECT command_id, status, result_sequence FROM orchestration_command_receipts WHERE command_type = 'consultation.complete'`;
+              assert.equal(receipts.length, 1);
+              assert.equal(receipts[0]!.status, "accepted");
+              return { task, admitted, input, completed, before, timeline, receipts };
+            }),
+          { databasePath },
+        );
+        yield* withNativeFeedback(
+          ({ service, orchestrator, readThread, started, steered }) =>
+            Effect.gen(function* () {
+              const admitted = yield* service.triggerWebhook({
+                ...feedbackRequest(first.task, consultationEnvelope()),
+                relayDeliveryId: "recreated-relay",
+              });
+              assert.deepEqual(admitted, first.admitted);
+              const replay = yield* service.completeConsultation(first.input);
+              assert.deepEqual(replay, { ...first.completed, replayed: true });
+              assert.equal(
+                (yield* Effect.result(
+                  service.completeConsultation({ ...first.input, answer: "Changed after restart" }),
+                ))._tag,
+                "Failure",
+              );
+              const timeline = yield* readThread();
+              const answer = timeline.items.find(
+                (item) => item.itemId === first.completed.resultItemId,
+              )!;
+              assert.deepEqual(
+                answer,
+                first.timeline.items.find((item) => item.itemId === answer.itemId),
+              );
+              assert.deepEqual(answer.replyTo, {
+                messageId: first.input.requestMessageId,
+                runId: first.completed.requestRunId,
+              });
+              assert.equal(answer.sourceEventId, consultationEnvelope().eventId);
+              assert.equal(answer.appOwned, "consultation");
+              const after = yield* orchestrator.getThreadProjection(feedbackOwner);
+              assert.deepEqual(after.messages, first.before.messages);
+              assert.deepEqual(after.turnItems, first.before.turnItems);
+              assert.deepEqual(after.runs, first.before.runs);
+              const sql = yield* SqlClient.SqlClient;
+              assert.deepEqual(
+                yield* sql`SELECT command_id, status, result_sequence FROM orchestration_command_receipts WHERE command_type = 'consultation.complete'`,
+                first.receipts,
+              );
+              assert.equal(started.length, 0);
+              assert.equal(steered.length, 0);
+            }),
+          { databasePath, existingOwner: true },
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect(
   "replays the same source event after recreating the native runtime and a relay retry",
