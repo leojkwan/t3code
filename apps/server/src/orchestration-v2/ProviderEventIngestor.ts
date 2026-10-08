@@ -392,25 +392,27 @@ export const layer: Layer.Layer<
         const candidate =
           input.event.type === "message.updated"
             ? input.event.message
-            : input.event.type === "turn_item.updated" &&
-                input.event.turnItem.type === "assistant_message"
+            : input.event.type === "turn_item.updated"
               ? input.event.turnItem
               : undefined;
+        const reserved = (id: string) =>
+          ["agent-feedback-message:", "consultation-answer:", "consultation-answer-item:"].some(
+            (prefix) => id.startsWith(prefix),
+          );
         if (
           candidate !== undefined &&
-          (candidate.appOwned !== undefined ||
-            candidate.replyTo !== undefined ||
-            candidate.sourceEventId !== undefined ||
-            String(candidate.id).startsWith("consultation-answer:") ||
-            String(candidate.id).startsWith("consultation-answer-item:") ||
-            ("messageId" in candidate &&
-              String(candidate.messageId).startsWith("consultation-answer:")))
+          (("appOwned" in candidate && candidate.appOwned !== undefined) ||
+            ("replyTo" in candidate && candidate.replyTo !== undefined) ||
+            ("sourceEventId" in candidate && candidate.sourceEventId !== undefined) ||
+            reserved(candidate.id) ||
+            ("messageId" in candidate && reserved(candidate.messageId)))
         ) {
           return yield* new ProviderEventNormalizeError({
             providerSessionId: input.providerSessionId,
             threadId: input.threadId,
             providerEvent: input.event,
-            cause: "Provider events cannot mint or overwrite app-owned consultation answers.",
+            cause:
+              "Provider events cannot mint or overwrite signed peer inputs or app-owned consultation answers.",
           });
         }
         switch (input.event.type) {

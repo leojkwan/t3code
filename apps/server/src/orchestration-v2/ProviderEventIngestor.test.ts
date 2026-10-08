@@ -1488,6 +1488,30 @@ it.effect("refuses provider spoofing of app-owned consultation answers before pe
     for (const event of [
       { type: "message.updated" as const, driver: CODEX_DRIVER, message },
       { type: "turn_item.updated" as const, driver: CODEX_DRIVER, turnItem: item },
+      {
+        type: "turn_item.updated" as const,
+        driver: CODEX_DRIVER,
+        turnItem: {
+          ...item,
+          type: "reasoning" as const,
+          id: TurnItemId.make("consultation-answer-item:reserved-other-type"),
+          appOwned: undefined,
+          replyTo: undefined,
+          sourceEventId: undefined,
+        },
+      },
+      {
+        type: "message.updated" as const,
+        driver: CODEX_DRIVER,
+        message: {
+          ...message,
+          id: MessageId.make("agent-feedback-message:reserved-input"),
+          role: "user" as const,
+          appOwned: undefined,
+          replyTo: undefined,
+          sourceEventId: undefined,
+        },
+      },
     ]) {
       const result = yield* Effect.result(
         ingestor.ingestNormalized({

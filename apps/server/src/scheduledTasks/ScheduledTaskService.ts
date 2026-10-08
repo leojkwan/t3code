@@ -1858,6 +1858,27 @@ export const layer = Layer.effect(
           new EventSink.EventSinkWriteError({ commandId, eventCount: 0, cause });
         let replayed = false;
         const validate = Effect.gen(function* () {
+          const admission = yield* sql<{
+            readonly aggregate_kind: string;
+            readonly aggregate_id: string;
+            readonly command_type: string;
+            readonly status: string;
+            readonly result_sequence: number;
+          }>`
+            SELECT aggregate_kind, aggregate_id, command_type, status, result_sequence
+            FROM orchestration_command_receipts WHERE command_id = ${`agent-feedback:${eventKey}`}
+          `.pipe(Effect.mapError(refuse));
+          const accepted = admission[0];
+          if (
+            accepted?.aggregate_kind !== "thread" ||
+            accepted.aggregate_id !== input.threadId ||
+            accepted.command_type !== "message.dispatch" ||
+            accepted.status !== "accepted" ||
+            accepted.result_sequence <= 0
+          )
+            return yield* refuse(
+              "Completion requires the existing signed native input admission receipt.",
+            );
           const current = yield* threadManagement
             .getThreadProjection(input.threadId)
             .pipe(Effect.mapError(refuse));

@@ -681,6 +681,39 @@ it.effect(
   },
 );
 
+it.effect("an input-shaped record without its native admission receipt cannot complete", () =>
+  withNativeFeedback(({ service, orchestrator }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* nativeConsultationTask());
+      const envelope = consultationEnvelope();
+      yield* service.triggerWebhook(feedbackRequest(task, envelope));
+      const request = (yield* orchestrator.getThreadProjection(feedbackOwner)).messages.find(
+        (m) => m.scheduledTaskId === task.id,
+      )!;
+      const sql = yield* SqlClient.SqlClient;
+      const key = NodeCrypto.createHash("sha256").update(envelope.eventId).digest("hex");
+      yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${`agent-feedback:${key}`}`;
+      const result = yield* Effect.result(
+        service.completeConsultation({
+          environmentId: EnvironmentId.make("environment:feedback"),
+          threadId: feedbackOwner,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerSessionId: "provider:feedback",
+          requestMessageId: request.id,
+          answer: "This input has no admitted native receipt.",
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(feedbackOwner)).messages.filter(
+          (m) => m.appOwned === "consultation",
+        ).length,
+        0,
+      );
+    }),
+  ),
+);
+
 it.effect("a failed sibling request cannot borrow an answered consultation or revive its run", () =>
   withNativeFeedback(({ service, orchestrator }) =>
     Effect.gen(function* () {
