@@ -273,6 +273,7 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  readonly completeConsultation: Orchestrator.OrchestratorV2["Service"]["completeConsultation"];
   readonly ensureLegacyTranscript: (
     threadId: ThreadId,
   ) => Effect.Effect<void, LegacyV1ThreadImporter.LegacyV1ThreadImportError>;
@@ -799,6 +800,7 @@ const make = Effect.gen(function* () {
 
   return ThreadManagementService.of({
     ensureLegacyTranscript,
+    completeConsultation: orchestrator.completeConsultation,
     dispatch,
     getTimelinePage: (threadId, options) =>
       ensureProjectionTranscript(threadId).pipe(

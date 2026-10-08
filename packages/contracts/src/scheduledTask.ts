@@ -83,6 +83,42 @@ const ScheduledTaskAgentFeedbackPolicy = Schema.Struct({
   peers: Schema.Array(FeedbackReference).check(Schema.isMinLength(1), Schema.isMaxLength(2)),
 });
 
+const ScheduledTaskAgentConsultationPolicy = Schema.Struct({
+  type: Schema.Literal("agent_consultation"),
+  ownerThreadId: ThreadId,
+  humanMessageId: MessageId,
+  workspaceId: FeedbackReference,
+  recipientId: FeedbackReference,
+  peers: Schema.Array(
+    Schema.Struct({
+      userId: FeedbackReference,
+      botId: FeedbackReference,
+      appId: Schema.optional(FeedbackReference),
+    }),
+  ).check(Schema.isMinLength(1), Schema.isMaxLength(2)),
+});
+const ScheduledTaskAgentDeliveryPolicy = Schema.Union([
+  ScheduledTaskAgentFeedbackPolicy,
+  ScheduledTaskAgentConsultationPolicy,
+]);
+
+/** An addressed question is evidence on a fixed human-owned task, not a new human request. */
+export const ScheduledTaskAgentConsultation = Schema.Struct({
+  intent: Schema.Literal("consultation"),
+  eventId: FeedbackReference,
+  workspaceId: FeedbackReference,
+  channelId: FeedbackReference,
+  threadTs: FeedbackTimestamp,
+  peerId: FeedbackReference,
+  peerBotId: FeedbackReference,
+  peerAppId: Schema.optional(FeedbackReference),
+  recipientId: FeedbackReference,
+  origin: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
+  artifact: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2_048))),
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(32_000)),
+});
+export type ScheduledTaskAgentConsultation = typeof ScheduledTaskAgentConsultation.Type;
+
 /** Lower-authority peer evidence, checked over the exact signed request body. */
 export const ScheduledTaskAgentFeedback = Schema.Struct({
   eventId: FeedbackReference,
@@ -120,7 +156,7 @@ const ScheduledTaskWebhookSchedule = Schema.Struct({
   signature: Schema.NullOr(ScheduledTaskWebhookSignature),
   // Optional so rows saved before this setting existed still decode.
   maxDeliveryAgeMinutes: Schema.optional(Schema.NullOr(WebhookMaxDeliveryAgeMinutes)),
-  deliveryPolicy: Schema.optional(ScheduledTaskAgentFeedbackPolicy),
+  deliveryPolicy: Schema.optional(ScheduledTaskAgentDeliveryPolicy),
 }).annotate({
   description:
     "Run on each request to the task's webhook URL. The prompt may use {{body.path}}, {{headers.name}}, {{query.name}}, {{body}} and {{request}} placeholders.",
@@ -147,7 +183,7 @@ const ScheduledTaskUpsertWebhookSchedule = Schema.Struct({
     description: "Signature check; omit or null to accept requests by URL token only.",
   }),
   maxDeliveryAgeMinutes: Schema.optional(Schema.NullOr(WebhookMaxDeliveryAgeMinutes)),
-  deliveryPolicy: Schema.optional(ScheduledTaskAgentFeedbackPolicy),
+  deliveryPolicy: Schema.optional(ScheduledTaskAgentDeliveryPolicy),
 }).annotate({
   description:
     "Run on each request to the task's webhook URL. The prompt may use {{body.path}}, {{headers.name}}, {{query.name}}, {{body}} and {{request}} placeholders.",

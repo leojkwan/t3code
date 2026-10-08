@@ -389,6 +389,30 @@ export const layer: Layer.Layer<
 
     const normalize: ProviderEventIngestorV2Shape["normalize"] = (input) =>
       Effect.gen(function* () {
+        const candidate =
+          input.event.type === "message.updated"
+            ? input.event.message
+            : input.event.type === "turn_item.updated" &&
+                input.event.turnItem.type === "assistant_message"
+              ? input.event.turnItem
+              : undefined;
+        if (
+          candidate !== undefined &&
+          (candidate.appOwned !== undefined ||
+            candidate.replyTo !== undefined ||
+            candidate.sourceEventId !== undefined ||
+            String(candidate.id).startsWith("consultation-answer:") ||
+            String(candidate.id).startsWith("consultation-answer-item:") ||
+            ("messageId" in candidate &&
+              String(candidate.messageId).startsWith("consultation-answer:")))
+        ) {
+          return yield* new ProviderEventNormalizeError({
+            providerSessionId: input.providerSessionId,
+            threadId: input.threadId,
+            providerEvent: input.event,
+            cause: "Provider events cannot mint or overwrite app-owned consultation answers.",
+          });
+        }
         switch (input.event.type) {
           case "app_thread.created":
             return [

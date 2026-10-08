@@ -14,6 +14,13 @@ const handlers = {
       return yield* service.capabilities(scope);
     }),
   ),
+  t3_consultation_complete: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.completeConsultation(scope, input);
+    }),
+  ),
   delegate_task: McpToolAccess.actsAsCaller((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

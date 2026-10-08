@@ -1,3 +1,10 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- signing the real hook fixture.
+import * as NodeCrypto from "node:crypto";
+import * as NodePlatformCrypto from "@effect/platform-node/NodeCrypto";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -16,6 +23,7 @@ import {
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ThreadProjection,
   OrchestratorMcpCreateThreadsResult,
+  OrchestratorMcpConsultationCompleteResult,
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpTaskCancelResult,
   OrchestratorMcpThreadInterruptResult,
@@ -510,7 +518,268 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
     listWebhookDeliveries: () => Effect.die("unused in this test"),
     getWebhookDelivery: () => Effect.die("unused in this test"),
     triggerWebhook: () => Effect.die("unused in this test"),
+    completeConsultation: () => Effect.die("unused in this test"),
   }),
+);
+
+it.live(
+  "signed direct consultations complete through the scoped MCP transport with typed per-input readback",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("consultation-mcp");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const registry = ProviderAdapterRegistry.layerFromAdapters([
+          makeDeterministicAdapter({
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            capabilities: CodexProviderCapabilitiesV2,
+            capturedTurns,
+            shouldComplete: () => false,
+            response: () => "unused",
+          }),
+        ]);
+        const database = SqlitePersistence.layerMemory;
+        const native = ProviderReplayHarness.layerWithRegistry(
+          { name: "consultation-mcp", runtimePolicyOverride: { cwd } },
+          registry,
+          { databaseLayer: database, runEffectWorker: false },
+        );
+        const management = ThreadManagementService.layer.pipe(Layer.provide(native));
+        const secretRequests = Layer.mock(SecretRequests.SecretRequests)({});
+        const scheduled = ScheduledTaskService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              database,
+              native,
+              management,
+              NodePlatformCrypto.layer,
+              Scheduler.layer,
+              secretRequests,
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+                launch: () => Effect.die("A consultation cannot launch a new thread"),
+              }),
+            ),
+          ),
+        );
+        const layers = McpHttpServer.layerOrchestratorToolkit.pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provideMerge(native),
+          Layer.provideMerge(management),
+          Layer.provideMerge(scheduled),
+          Layer.provide(registry),
+          Layer.provide(
+            ProviderRegistryMock.layer([
+              makeProviderSnapshot({
+                instanceId: codexInstanceId,
+                driver: ProviderDriverKind.make("codex"),
+                model: codexModel,
+              }),
+            ]),
+          ),
+          Layer.provide(secretRequests),
+          Layer.provide(NodePlatformCrypto.layer),
+          Layer.provide(
+            Layer.mock(ProjectService.ProjectService)({
+              getById: () => Effect.succeed(Option.none()),
+            }),
+          ),
+          Layer.provide(NodeServices.layer),
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          const server = yield* McpServer.McpServer;
+          const owner = ThreadId.make("thread:consultation-mcp");
+          const human = MessageId.make("message:consultation-human");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("consultation:create"),
+            threadId: owner,
+            projectId,
+            title: "Consultation owner",
+            createdBy: "user",
+            creationSource: "web",
+            modelSelection: codexSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          const running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" && event.payload.status === "running",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("consultation:human"),
+            threadId: owner,
+            messageId: human,
+            text: "Answer these two scoped peers without ending my parent run.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* worker.drain();
+          yield* Fiber.join(running);
+          const { task } = yield* service.upsert({
+            title: "Bound consultation",
+            prompt: "peer evidence",
+            projectId,
+            threadId: owner,
+            enabled: true,
+            createdBy: "user",
+            creationSource: "web",
+            workspaceStrategy: { type: "root" },
+            modelSelection: codexSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            schedule: {
+              type: "webhook",
+              signature: {
+                header: "x-consultation-signature",
+                encoding: "hex",
+                prefix: "sha256=",
+                secret: "test-consultation-signature",
+              },
+              deliveryPolicy: {
+                type: "agent_consultation",
+                ownerThreadId: owner,
+                humanMessageId: human,
+                workspaceId: "T_WORKSPACE",
+                recipientId: "U_T3",
+                peers: [
+                  { userId: "U_G", botId: "B_G", appId: "A_G" },
+                  { userId: "U_HERMES", botId: "B_HERMES" },
+                ],
+              },
+            },
+          });
+          const hook = task.webhook!.path.split("/");
+          const events = ["slack:C_SOURCE:1791359015.942709", "slack:C_SOURCE:1791359016.942709"];
+          for (const [index, peer] of ["G", "HERMES"].entries()) {
+            const body = new TextEncoder().encode(
+              JSON.stringify({
+                intent: "consultation",
+                eventId: events[index],
+                workspaceId: "T_WORKSPACE",
+                channelId: "C_SOURCE",
+                threadTs: "1791356867.754099",
+                peerId: `U_${peer}`,
+                peerBotId: `B_${peer}`,
+                ...(peer === "G" ? { peerAppId: "A_G" } : {}),
+                recipientId: "U_T3",
+                origin: `https://workspace.slack.com/archives/C_SOURCE/p${events[index]!.split(":").at(-1)!.replace(".", "")}`,
+                body: `Question from ${peer}, within the human-authorized consultation scope.`,
+              }),
+            );
+            expect(
+              (yield* service.triggerWebhook({
+                hookId: decodeURIComponent(hook[3]!),
+                token: hook[4]!,
+                method: "POST",
+                path: task.webhook!.path,
+                query: "",
+                body,
+                bodyText: new TextDecoder().decode(body),
+                headers: {
+                  "content-type": "application/json",
+                  "x-consultation-signature": `sha256=${NodeCrypto.createHmac("sha256", "test-consultation-signature").update(body).digest("hex")}`,
+                },
+              }))._tag,
+            ).toBe("accepted");
+          }
+          yield* worker.drain();
+          const before = yield* orchestrator.getThreadProjection(owner);
+          const requests = before.messages.filter((message) => message.scheduledTaskId === task.id);
+          const scope: McpInvocationContext.McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:consultation-mcp"),
+            requestNamespace: "provider-session:consultation",
+            thread: {
+              threadId: owner,
+              providerSessionId: "provider-session:consultation",
+              providerInstanceId: codexInstanceId,
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const invoke = (args: Record<string, unknown>, caller = scope) =>
+            server
+              .callTool({ name: "t3_consultation_complete", arguments: args })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
+                Effect.provideService(McpSchema.McpServerClient, client),
+              );
+          const answer = {
+            requestMessageId: requests[1]!.id,
+            answer: "Hermes: integrate the correction and retain this answer's request identity.",
+          };
+          expect(
+            (yield* invoke(answer, {
+              ...scope,
+              thread: undefined,
+              client: { sessionId: "outside", label: "outside", access: "full-access" },
+            })).isError,
+          ).toBe(true);
+          expect(
+            (yield* Effect.result(invoke({ ...answer, threadId: "thread:foreign", actor: "user" })))
+              ._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* invoke({ requestMessageId: human, answer: "Not a consultation." })).isError,
+          ).toBe(true);
+          const hermes = yield* Schema.decodeUnknownEffect(
+            OrchestratorMcpConsultationCompleteResult,
+          )((yield* invoke(answer)).structuredContent);
+          const g = yield* Schema.decodeUnknownEffect(OrchestratorMcpConsultationCompleteResult)(
+            (yield* invoke({
+              requestMessageId: requests[0]!.id,
+              answer: "G: use this distinct answer for the first question.",
+            })).structuredContent,
+          );
+          expect(hermes.sourceEventId).toBe(events[1]);
+          expect(g.sourceEventId).toBe(events[0]);
+          expect(hermes.requestRunId).toBe(g.requestRunId);
+          const read = yield* server
+            .callTool({
+              name: "t3_thread_read",
+              arguments: { threadId: owner, view: "messages", limit: 30, maxCharsPerItem: 32000 },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+          const timeline = yield* decodeThreadReadResult(read.structuredContent);
+          for (const completed of [hermes, g]) {
+            const item = timeline.items.find((item) => item.itemId === completed.resultItemId);
+            expect(item).toMatchObject({
+              appOwned: "consultation",
+              sourceEventId: completed.sourceEventId,
+              createdBy: "agent",
+              creationSource: "server",
+              replyTo: { messageId: completed.requestMessageId, runId: completed.requestRunId },
+            });
+          }
+          expect((yield* invoke(answer)).structuredContent).toMatchObject({
+            ...hermes,
+            replayed: true,
+          });
+          expect((yield* invoke({ ...answer, answer: "Overwrite attempt" })).isError).toBe(true);
+          const after = yield* orchestrator.getThreadProjection(owner);
+          expect(after.runs).toEqual(before.runs);
+          expect(after.providerTurns).toEqual(before.providerTurns);
+          expect(yield* Ref.get(capturedTurns)).toHaveLength(1);
+        }).pipe(Effect.provide(layers));
+      }),
+    ),
 );
 
 describe("orchestrator MCP toolkit", () => {
@@ -671,6 +940,7 @@ describe("orchestrator MCP toolkit", () => {
               listWebhookDeliveries: () => Effect.die("unused in this test"),
               getWebhookDelivery: () => Effect.die("unused in this test"),
               triggerWebhook: () => Effect.die("unused in this test"),
+              completeConsultation: () => Effect.die("unused in this test"),
             }),
           );
           const layerTest = Layer.merge(

@@ -1,5 +1,7 @@
 import {
   OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpConsultationCompleteInput,
+  OrchestratorMcpConsultationCompleteResult,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
   OrchestratorMcpDelegateTaskInput,
@@ -256,8 +258,22 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
+const ConsultationCompleteTool = Tool.make("t3_consultation_complete", {
+  description:
+    "Answer one accepted direct consultation on your calling thread while its attributed run is active. Pass its immutable requestMessageId and a substantive bounded answer. This app-owned answer does not end the parent run. Same answer replays its deterministic native result; changed answer conflicts. Only a live provider-scoped owner may complete its own accepted request.",
+  parameters: OrchestratorMcpConsultationCompleteInput,
+  success: OrchestratorMcpConsultationCompleteResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Answer an accepted consultation")
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
+  ConsultationCompleteTool,
   DelegateTaskTool,
   TaskStatusTool,
   TaskCancelTool,

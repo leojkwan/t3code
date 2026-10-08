@@ -39,6 +39,22 @@ describe("ScheduledTaskSchedule", () => {
 });
 
 describe("ScheduledTaskUpsertSchedule", () => {
+  it("roundtrips a direct consultation binding without inventing a solicitation", () => {
+    const deliveryPolicy = {
+      type: "agent_consultation",
+      ownerThreadId: feedbackPolicy.ownerThreadId,
+      humanMessageId: feedbackPolicy.humanMessageId,
+      workspaceId: "T_WORKSPACE",
+      recipientId: "U_T3",
+      peers: [
+        { userId: "U_G", botId: "B_G", appId: "A_G" },
+        { userId: "U_HERMES", botId: "B_HERMES" },
+      ],
+    };
+    const schedule = { type: "webhook", signature: null, deliveryPolicy };
+    expect(decodeUpsertSchedule(schedule)).toEqual(schedule);
+    expect(decodeSchedule(schedule)).toEqual(schedule);
+  });
   it("preserves a fixed owner and human request on an opted-in feedback webhook", () => {
     expect(
       decodeUpsertSchedule({

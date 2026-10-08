@@ -1109,7 +1109,16 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+export const OrchestrationV2ConsultationAnswerFields = {
+  createdBy: Schema.optional(OrchestrationV2Actor),
+  creationSource: Schema.optional(OrchestrationV2CreationSource),
+  appOwned: Schema.optional(Schema.Literal("consultation")),
+  replyTo: Schema.optional(Schema.Struct({ messageId: MessageId, runId: RunId })),
+  sourceEventId: Schema.optional(TrimmedNonEmptyString),
+};
+
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  ...OrchestrationV2ConsultationAnswerFields,
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -1387,6 +1396,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("assistant_message"),
+    ...OrchestrationV2ConsultationAnswerFields,
     messageId: MessageId,
     text: Schema.String,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
@@ -2165,6 +2175,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("assistant_message"),
+    ...OrchestrationV2ConsultationAnswerFields,
     messageId: MessageId,
     text: Schema.String,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),

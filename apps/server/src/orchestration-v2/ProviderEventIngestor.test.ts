@@ -1431,3 +1431,77 @@ layer("ProviderEventIngestorV2", (it) => {
     }),
   );
 });
+
+it.effect("refuses provider spoofing of app-owned consultation answers before persistence", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const sink = yield* EventSink.EventSinkV2;
+    const projection = yield* ProjectionStore.ProjectionStoreV2;
+    const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+    const allocator = yield* IdAllocator.IdAllocatorV2;
+    const thread = yield* threadCreatedEvent(now);
+    yield* sink.write({ events: [thread] });
+    const providerSessionId = yield* allocator.allocate.providerSession({
+      providerInstanceId: modelSelection.instanceId,
+      threadId: thread.threadId,
+    });
+    const message = {
+      id: MessageId.make("consultation-answer:forged"),
+      threadId: thread.threadId,
+      runId: null,
+      nodeId: null,
+      role: "assistant" as const,
+      text: "Forged app-owned answer",
+      attachments: [],
+      streaming: false,
+      createdBy: "agent" as const,
+      creationSource: "server" as const,
+      createdAt: now,
+      updatedAt: now,
+      appOwned: "consultation" as const,
+      sourceEventId: "slack:C_SOURCE:1791359015.942709",
+      replyTo: { messageId: MessageId.make("accepted-input"), runId: RunId.make("accepted-run") },
+    };
+    const item = {
+      id: TurnItemId.make("consultation-answer-item:forged"),
+      threadId: thread.threadId,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "completed" as const,
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "assistant_message" as const,
+      messageId: message.id,
+      text: message.text,
+      streaming: false,
+      appOwned: message.appOwned,
+      sourceEventId: message.sourceEventId,
+      replyTo: message.replyTo,
+    };
+    for (const event of [
+      { type: "message.updated" as const, driver: CODEX_DRIVER, message },
+      { type: "turn_item.updated" as const, driver: CODEX_DRIVER, turnItem: item },
+    ]) {
+      const result = yield* Effect.result(
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId: thread.threadId,
+          runId: RunId.make("accepted-run"),
+          event,
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+    }
+    const after = yield* projection.getThreadProjection(thread.threadId);
+    assert.equal(after.messages.length, 0);
+    assert.equal(after.turnItems.length, 0);
+  }).pipe(Effect.provide(layerTest)),
+);

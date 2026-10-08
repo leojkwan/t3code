@@ -1,5 +1,7 @@
 import {
   CommandId,
+  type OrchestratorMcpConsultationCompleteInput,
+  type OrchestratorMcpConsultationCompleteResult,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -170,6 +172,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
   ) => Effect.Effect<OrchestratorMcpThreadReadResult, OrchestratorMcpFailure>;
+  readonly completeConsultation: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpConsultationCompleteInput,
+  ) => Effect.Effect<OrchestratorMcpConsultationCompleteResult, OrchestratorMcpFailure>;
   readonly sendToThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadSendInput,
@@ -786,6 +792,17 @@ function timelineItem(input: {
           .get(input.row.sourceThreadId)
           ?.find((candidate) => candidate.id === messageId);
   return {
+    ...(input.row.item.type === "assistant_message" &&
+    input.row.item.appOwned === "consultation" &&
+    message?.appOwned === "consultation" &&
+    message.createdBy === "agent" &&
+    message.creationSource === "server"
+      ? {
+          appOwned: input.row.item.appOwned,
+          replyTo: input.row.item.replyTo,
+          sourceEventId: input.row.item.sourceEventId,
+        }
+      : {}),
     position: input.row.position,
     visibility: input.row.visibility,
     sourceThreadId: input.row.sourceThreadId,
@@ -2345,6 +2362,21 @@ const make = Effect.gen(function* () {
           nextPosition: page.at(-1)?.position ?? null,
           hasMore: timeline.hasMore,
         } satisfies OrchestratorMcpThreadReadResult;
+      }),
+    completeConsultation: (scope, input) =>
+      Effect.gen(function* () {
+        const caller = yield* loadThreadCaller(scope, "t3_consultation_complete");
+        yield* assertLiveCaller(scope, caller.parent);
+        return yield* scheduledTasks
+          .completeConsultation({
+            environmentId: scope.environmentId,
+            threadId: caller.parent.thread.id,
+            providerInstanceId: scope.thread!.providerInstanceId,
+            providerSessionId: scope.thread!.providerSessionId,
+            requestMessageId: input.requestMessageId,
+            answer: input.answer,
+          })
+          .pipe(Effect.mapError((error) => failure("orchestration_error", errorMessage(error))));
       }),
     sendToThread: (scope, input) =>
       Effect.gen(function* () {

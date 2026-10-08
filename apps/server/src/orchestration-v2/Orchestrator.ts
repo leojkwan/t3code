@@ -15,6 +15,7 @@ import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
+  EventId,
   isProviderNativeSubagentThread,
   MessageId,
   type ModelSelection,
@@ -83,7 +84,7 @@ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "./Notification.ts";
 import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
-import { CommandCommitCheck, EventSinkV2 } from "./EventSink.ts";
+import { CommandCommitCheck, EventSinkV2, type CommandCommitCheckValue } from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
@@ -265,6 +266,18 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  /** Internal application boundary only; never a public dispatch or provider event. */
+  readonly completeConsultation: (input: {
+    readonly threadId: ThreadId;
+    readonly requestMessageId: MessageId;
+    readonly requestRunId: RunId;
+    readonly sourceEventId: string;
+    readonly answer: string;
+    readonly commandId: CommandId;
+    readonly resultMessageId: MessageId;
+    readonly resultItemId: TurnItemId;
+    readonly commitCheck: CommandCommitCheckValue;
+  }) => Effect.Effect<{ readonly replayed: boolean }, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   /** Startup pass that settles delegated-task results and deliveries runs left behind. */
   readonly recoverDelegatedTasks: Effect.Effect<void>;
@@ -10608,6 +10621,110 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
     threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command));
 
+  const completeConsultation: OrchestratorV2Shape["completeConsultation"] = (input) =>
+    threadDispatch
+      .withLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const target = yield* projectionStore.getThreadProjection(input.threadId);
+          const request = target.messages.find((message) => message.id === input.requestMessageId);
+          const run = target.runs.find((candidate) => candidate.id === input.requestRunId);
+          if (request === undefined || request.runId !== input.requestRunId || run === undefined) {
+            return yield* new OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "consultation.complete",
+              cause: "The accepted input has no matching execution.",
+            });
+          }
+          const now = yield* DateTime.now;
+          const replyTo = { messageId: request.id, runId: run.id };
+          const message: OrchestrationV2ConversationMessage = {
+            id: input.resultMessageId,
+            threadId: input.threadId,
+            runId: run.id,
+            nodeId: request.nodeId,
+            role: "assistant",
+            text: input.answer,
+            attachments: [],
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "server",
+            createdAt: now,
+            updatedAt: now,
+            appOwned: "consultation",
+            replyTo,
+            sourceEventId: input.sourceEventId,
+          };
+          const item: OrchestrationV2TurnItem = {
+            id: input.resultItemId,
+            threadId: input.threadId,
+            runId: run.id,
+            nodeId: request.nodeId,
+            providerThreadId: run.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: Math.max(-1, ...target.turnItems.map((entry) => entry.ordinal)) + 1,
+            type: "assistant_message",
+            messageId: message.id,
+            text: input.answer,
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "server",
+            status: "completed",
+            title: "Consultation answer",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            appOwned: "consultation",
+            replyTo,
+            sourceEventId: input.sourceEventId,
+          };
+          const events: OrchestrationV2DomainEvent[] = [
+            {
+              id: EventId.make(`${input.commandId}:message`),
+              type: "message.updated",
+              threadId: input.threadId,
+              runId: run.id,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: message,
+            },
+            {
+              id: EventId.make(`${input.commandId}:item`),
+              type: "turn-item.updated",
+              threadId: input.threadId,
+              runId: run.id,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: item,
+            },
+          ];
+          const committed = yield* eventSink
+            .commitCommand({
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: "consultation.complete",
+              acceptedAt: now,
+              events,
+              effects: [],
+            })
+            .pipe(Effect.provideService(CommandCommitCheck, input.commitCheck));
+          return { replayed: !committed.committed };
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          Schema.is(OrchestratorDispatchError)(cause)
+            ? cause
+            : new OrchestratorDispatchError({
+                commandId: input.commandId,
+                commandType: "consultation.complete",
+                cause,
+              }),
+        ),
+      );
+
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
       const threadId = stored.event.threadId;
@@ -10804,6 +10921,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     recoverDelegatedTask,
     delegatedTaskResultPending,
     dispatch: dispatchWithReceipt,
+    completeConsultation,
     getTimelinePage: (threadId, options) =>
       projectionStore
         .getTimelinePage(threadId, options)
@@ -10931,6 +11049,14 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
     recoverDelegatedTasks: Effect.void,
     recoverDelegatedTask: () => Effect.void,
     delegatedTaskResultPending: () => Effect.succeed(false),
+    completeConsultation: (input) =>
+      Effect.fail(
+        new OrchestratorDispatchError({
+          commandId: input.commandId,
+          commandType: "consultation.complete",
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
     dispatch: (command) =>
       Effect.fail(
         new OrchestratorDispatchError({

@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 
 import {
   OrchestratorMcpCreateThreadsInput,
+  OrchestratorMcpConsultationCompleteInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadInterruptInput,
@@ -22,6 +23,29 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("closes consultation completion to the immutable request and bounded answer", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpConsultationCompleteInput);
+    const answer = {
+      requestMessageId: "message:accepted-consultation",
+      answer: "A substantive answer.",
+    };
+    expect(decode(answer)).toEqual(answer);
+    for (const extra of [
+      "threadId",
+      "role",
+      "runId",
+      "resultId",
+      "sourceEventId",
+      "model",
+      "actor",
+      "humanMessageId",
+    ]) {
+      expect(() => decode({ ...answer, [extra]: "forged" })).toThrow();
+    }
+    expect(() => decode({ ...answer, answer: " " })).toThrow();
+    expect(() => decode({ ...answer, answer: "x".repeat(32_001) })).toThrow();
+  });
+
   it("decodes cross-provider delegated task requests and durable results", () => {
     const request = decodeDelegateTaskInput({
       task: "Inspect the workspace and report the result.",

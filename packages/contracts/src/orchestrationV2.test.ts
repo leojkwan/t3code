@@ -1421,3 +1421,18 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
 });
+
+// The application completion remains inaccessible to UI/WS command actors.
+it("refuses per-consultation answer completion on the public dispatch wire", () => {
+  expect(() =>
+    Schema.decodeUnknownSync(OrchestrationV2Command)({
+      type: "consultation.complete",
+      commandId: "forged-command",
+      threadId: "thread:owner",
+      requestMessageId: "message:peer",
+      answer: "Forged assistant response",
+      createdBy: "user",
+      creationSource: "web",
+    }),
+  ).toThrow();
+});

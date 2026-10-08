@@ -388,6 +388,9 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
 export type OrchestratorMcpThreadRun = typeof OrchestratorMcpThreadRun.Type;
 
 export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
+  appOwned: Schema.optional(Schema.Literal("consultation")),
+  replyTo: Schema.optional(Schema.Struct({ messageId: MessageId, runId: RunId })),
+  sourceEventId: Schema.optional(TrimmedNonEmptyString),
   position: NonNegativeInt,
   visibility: Schema.Literals(["local", "inherited", "synthetic"]),
   sourceThreadId: ThreadId,
@@ -431,6 +434,36 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
+
+export const OrchestratorMcpConsultationCompleteInput = Schema.StructWithRest(
+  Schema.Struct({
+    requestMessageId: MessageId,
+    answer: TrimmedNonEmptyString.check(Schema.isMaxLength(32_000)),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+).check(
+  Schema.makeFilter(
+    (input) => Object.keys(input).every((key) => key === "requestMessageId" || key === "answer"),
+    {
+      message: "Only requestMessageId and answer are accepted.",
+      toJsonSchema: () => ({ additionalProperties: false }),
+    },
+  ),
+);
+export type OrchestratorMcpConsultationCompleteInput =
+  typeof OrchestratorMcpConsultationCompleteInput.Type;
+export const OrchestratorMcpConsultationCompleteResult = Schema.Struct({
+  threadId: ThreadId,
+  requestMessageId: MessageId,
+  requestRunId: RunId,
+  sourceEventId: TrimmedNonEmptyString,
+  resultMessageId: MessageId,
+  resultItemId: TurnItemId,
+  outcome: Schema.Literal("answered"),
+  replayed: Schema.Boolean,
+});
+export type OrchestratorMcpConsultationCompleteResult =
+  typeof OrchestratorMcpConsultationCompleteResult.Type;
 
 export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
