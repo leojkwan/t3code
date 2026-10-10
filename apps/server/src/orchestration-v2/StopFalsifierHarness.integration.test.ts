@@ -31,6 +31,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -719,7 +720,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       let blockedThread: ThreadId | undefined;
       return yield* withHarness(
         `pending-${scenario}`,
-        ({ orchestrator, worker, stub, threadId, sql }) =>
+        ({ orchestrator, worker, stub, threadId, sql, executor }) =>
           Effect.gen(function* () {
             let target = threadId;
             if (descendant || type === "steer") {
@@ -770,20 +771,41 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
               commandId: CommandId.make(`${scenario}-stop`),
               threadId: target,
             };
+            let stopPhase = "root-hold";
+            let rootHoldSequence: number | null = null;
             const stopping = yield* Effect.gen(function* () {
               if (descendant) {
                 // The child's suspended call must not block controls on its root.
-                yield* orchestrator.dispatch({
+                const held = yield* orchestrator.dispatch({
                   type: "goal.hold",
                   commandId: CommandId.make(`${scenario}-root-hold`),
                   threadId,
                   hold: "stop-pending-descendant",
                 });
+                rootHoldSequence = held.sequence;
               }
-              return yield* orchestrator.dispatch(stopCommand);
+              stopPhase = "child-stop";
+              const result = yield* orchestrator.dispatch(stopCommand);
+              stopPhase = "completed";
+              return result;
             }).pipe(Effect.timeout("1 second"), Effect.forkScoped);
             yield* TestClock.adjust("1 second");
             const stopped = yield* Fiber.await(stopping);
+            const activeKeys = yield* executor.activeKeys;
+            const providerReleased = yield* Deferred.isDone(release);
+            console.error(
+              "DG04_STOP_EXIT",
+              JSON.stringify({
+                scenario,
+                phase: stopPhase,
+                exit: stopped._tag,
+                cause: Exit.isFailure(stopped) ? Cause.pretty(stopped.cause) : null,
+                rootHoldSequence,
+                stopSequence: Exit.isSuccess(stopped) ? stopped.value.sequence : null,
+                activeKeys,
+                providerReleased,
+              }),
+            );
             assert.isTrue(Exit.isSuccess(stopped), "Stop must commit before provider release");
             assert.isFalse(yield* Deferred.isDone(release));
             const rows = yield* sql<{ status: string }>`
