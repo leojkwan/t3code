@@ -32,6 +32,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -707,6 +708,15 @@ it.effect("F3 thread.stop interrupts an active turn after its start call returne
   ),
 );
 
+class StopProgressInconclusive extends Data.TaggedError("StopProgressInconclusive")<{
+  readonly stage: string;
+  readonly schedulerRounds: number;
+}> {
+  override get message() {
+    return `${this.stage}: finite scheduler work exhausted; INCONCLUSIVE / NOT QUALIFIED`;
+  }
+}
+
 it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as const)(
   "F3 pending provider $0 permits Stop before release",
   (scenario) =>
@@ -718,6 +728,34 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       const type = scenario.endsWith("steer") ? "steer" : "start";
       const descendant = scenario.startsWith("descendant");
       let blockedThread: ThreadId | undefined;
+      let stoppingFiber: Fiber.Fiber<unknown, unknown> | undefined;
+      let executingFiber: Fiber.Fiber<unknown, unknown> | undefined;
+      // A fixed work bound, not a latency target. Never advance time to judge progress.
+      const maxSchedulerRounds = 256;
+      const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) =>
+        Effect.gen(function* () {
+          for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
+            const exit = yield* Effect.sync(() => fiber.pollUnsafe());
+            if (exit !== undefined) return { exit, rounds };
+            if (rounds < maxSchedulerRounds) yield* Effect.yieldNow;
+          }
+          return { exit: undefined, rounds: maxSchedulerRounds };
+        });
+      const finishWithinBound = <A, E>(fiber: Fiber.Fiber<A, E>, stage: string) =>
+        Effect.gen(function* () {
+          const progress = yield* pollFrozen(fiber);
+          if (progress.exit === undefined) {
+            return yield* Effect.fail(
+              new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }),
+            );
+          }
+          return yield* progress.exit;
+        });
+      const runWithinBound = <A, E, R>(work: Effect.Effect<A, E, R>, stage: string) =>
+        Effect.gen(function* () {
+          const fiber = yield* work.pipe(Effect.forkScoped);
+          return yield* finishWithinBound(fiber, stage);
+        });
       return yield* withHarness(
         `pending-${scenario}`,
         ({ orchestrator, worker, stub, threadId, sql, executor }) =>
@@ -726,8 +764,8 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
             if (descendant || type === "steer") {
               const running = yield* waitForRunning(orchestrator);
               yield* orchestrator.dispatch(messageCommand(threadId, `${scenario}-first`));
-              yield* worker.drain();
-              yield* Fiber.join(running);
+              yield* runWithinBound(worker.drain(), "setup-worker");
+              yield* finishWithinBound(running, "setup-running-event");
             }
             if (descendant) {
               const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
@@ -748,8 +786,8 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                 .childThreadId!;
               if (type === "steer") {
                 const running = yield* waitForRunning(orchestrator);
-                yield* worker.drain();
-                yield* Fiber.join(running);
+                yield* runWithinBound(worker.drain(), "setup-worker");
+                yield* finishWithinBound(running, "setup-running-event");
               }
             }
             blockedThread = target;
@@ -763,7 +801,19 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
               yield* orchestrator.dispatch(messageCommand(target, `${scenario}-pending`));
             }
             const executing = yield* worker.drain().pipe(Effect.forkScoped);
-            yield* Deferred.await(entered);
+            executingFiber = executing;
+            yield* runWithinBound(Deferred.await(entered), "provider-entered");
+            const pending = yield* runWithinBound(
+              sql<{ effect_id: string; status: string }>`
+                SELECT effect_id, status FROM orchestration_v2_effect_outbox
+                WHERE thread_id = ${target}
+                  AND effect_type = ${`provider-turn.${type}`} AND status = 'running'
+              `,
+              "claimed-effect-read",
+            );
+            assert.equal(pending.length, 1, "The exact pending provider effect must be claimed");
+            const pendingEffectId = pending[0]!.effect_id;
+            const frozenTime = DateTime.toEpochMillis(yield* DateTime.now);
             const starts = stub.started.length;
             const steers = stub.steered.length;
             const stopCommand = {
@@ -783,49 +833,158 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                   hold: "stop-pending-descendant",
                 });
                 rootHoldSequence = held.sequence;
+                const accepted = yield* sql<{ status: string; result_sequence: number }>`
+                  SELECT status, result_sequence FROM orchestration_command_receipts
+                  WHERE command_id = ${CommandId.make(`${scenario}-root-hold`)}
+                `;
+                assert.equal(accepted.length, 1);
+                assert.equal(accepted[0]!.status, "accepted");
+                assert.equal(accepted[0]!.result_sequence, held.sequence);
               }
               stopPhase = "child-stop";
               const result = yield* orchestrator.dispatch(stopCommand);
               stopPhase = "completed";
               return result;
-            }).pipe(Effect.timeout("1 second"), Effect.forkScoped);
-            yield* TestClock.adjust("1 second");
-            const stopped = yield* Fiber.await(stopping);
-            const activeKeys = yield* executor.activeKeys;
-            const providerReleased = yield* Deferred.isDone(release);
+            }).pipe(Effect.forkScoped);
+            stoppingFiber = stopping;
+            const progress = yield* pollFrozen(stopping);
+            const phaseAtBound = stopPhase;
+            const rootHoldSequenceAtBound = rootHoldSequence;
+            // Capture durable state before any cleanup interruption or provider release.
+            const snapshot = yield* runWithinBound(
+              Effect.gen(function* () {
+                const receipt = yield* sql<{
+                  command_id: string;
+                  aggregate_id: string;
+                  command_type: string;
+                  status: string;
+                  error: string | null;
+                  result_sequence: number;
+                }>`
+                  SELECT command_id, aggregate_id, command_type, status, error, result_sequence
+                  FROM orchestration_command_receipts WHERE command_id = ${stopCommand.commandId}
+                `;
+                const rootReceipt = yield* sql<{ status: string; result_sequence: number }>`
+                  SELECT status, result_sequence FROM orchestration_command_receipts
+                  WHERE command_id = ${CommandId.make(`${scenario}-root-hold`)}
+                `;
+                const outbox = yield* sql<{ effect_id: string; status: string }>`
+                  SELECT effect_id, status FROM orchestration_v2_effect_outbox
+                  WHERE effect_id = ${pendingEffectId}
+                `;
+                return {
+                  receipt,
+                  rootReceipt,
+                  outbox,
+                  callbackInterrupted: yield* Deferred.isDone(cancelled),
+                  callbackReturned: yield* Deferred.isDone(returned),
+                  activeKeys: yield* executor.activeKeys,
+                  providerReleased: yield* Deferred.isDone(release),
+                  clock: DateTime.toEpochMillis(yield* DateTime.now),
+                };
+              }),
+              "pre-cleanup-snapshot",
+            );
             console.error(
-              "DG04_STOP_EXIT",
+              "DG04_STOP_PROGRESS",
               JSON.stringify({
                 scenario,
-                phase: stopPhase,
-                exit: stopped._tag,
-                cause: Exit.isFailure(stopped) ? Cause.pretty(stopped.cause) : null,
+                phase: phaseAtBound,
+                phaseAfterSnapshot: stopPhase,
+                pendingEffectId,
+                rootHoldSequenceAtBound,
+                exit: progress.exit?._tag ?? "Pending",
+                cause: progress.exit !== undefined && Exit.isFailure(progress.exit)
+                  ? Cause.pretty(progress.exit.cause)
+                  : null,
                 rootHoldSequence,
-                stopSequence: Exit.isSuccess(stopped) ? stopped.value.sequence : null,
-                activeKeys,
-                providerReleased,
+                stopSequence: progress.exit !== undefined && Exit.isSuccess(progress.exit)
+                  ? progress.exit.value.sequence
+                  : null,
+                schedulerRounds: progress.rounds,
+                maxSchedulerRounds,
+                frozenTime,
+                ...snapshot,
               }),
             );
+            assert.equal(snapshot.clock, frozenTime, "The progress judge must keep time frozen");
+            assert.isFalse(snapshot.providerReleased);
+            if (progress.exit === undefined) {
+              return yield* Effect.fail(
+                new StopProgressInconclusive({ stage: phaseAtBound, schedulerRounds: progress.rounds }),
+              );
+            }
+            const stopped = progress.exit;
             assert.isTrue(Exit.isSuccess(stopped), "Stop must commit before provider release");
             assert.isFalse(yield* Deferred.isDone(release));
-            const rows = yield* sql<{ status: string }>`
+            assert.equal(snapshot.receipt.length, 1, "Stop must have its durable accepted receipt");
+            assert.equal(snapshot.receipt[0]!.command_id, stopCommand.commandId);
+            assert.equal(snapshot.receipt[0]!.aggregate_id, target);
+            assert.equal(snapshot.receipt[0]!.command_type, "thread.stop");
+            assert.equal(snapshot.receipt[0]!.status, "accepted");
+            if (Exit.isSuccess(stopped)) {
+              assert.equal(snapshot.receipt[0]!.result_sequence, stopped.value.sequence);
+            }
+            assert.deepEqual(snapshot.outbox, [{ effect_id: pendingEffectId, status: "cancelled" }]);
+            const rows = yield* runWithinBound(sql<{ status: string }>`
               SELECT status FROM orchestration_v2_effect_outbox
               WHERE thread_id = ${target}
                 AND effect_type = ${`provider-turn.${type}`}
                 AND status = 'cancelled'
-            `;
+            `, "cancelled-effect-read");
             assert.equal(rows.length, 1, "The pending provider effect must be durably cancelled");
-            yield* Fiber.join(executing);
+            yield* finishWithinBound(executing, "worker-cancellation");
             assert.isTrue(yield* Deferred.isDone(cancelled));
             assert.isFalse(yield* Deferred.isDone(returned));
             // Replaying the same Stop receipt must not create another provider call.
-            yield* orchestrator.dispatch(stopCommand);
-            yield* worker.drain();
+            yield* runWithinBound(orchestrator.dispatch(stopCommand), "stop-replay");
+            yield* runWithinBound(worker.drain(), "replay-worker");
             assert.equal(stub.started.length, starts);
             assert.equal(stub.steered.length, steers);
-            const projection = yield* orchestrator.getThreadProjection(target);
+            const projection = yield* runWithinBound(
+              orchestrator.getThreadProjection(target), "terminal-read",
+            );
             assert.equal(projection.runs.at(-1)?.status, "interrupted");
-          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined))),
+          }).pipe(
+            Effect.ensuring(
+              Effect.gen(function* () {
+                const cleanup = yield* Effect.gen(function* () {
+                  yield* Deferred.succeed(release, undefined);
+                  if (stoppingFiber !== undefined) yield* Fiber.interrupt(stoppingFiber);
+                  if (executingFiber !== undefined) yield* Fiber.interrupt(executingFiber);
+                }).pipe(Effect.timeout("1 second"), Effect.forkScoped);
+                // First permit finite runnable cleanup; time advances only if interruption needs it.
+                let cleaned = yield* pollFrozen(cleanup);
+                if (cleaned.exit === undefined) {
+                  yield* TestClock.adjust("1 second");
+                  cleaned = yield* pollFrozen(cleanup);
+                }
+                console.error("DG04_STOP_CLEANUP", JSON.stringify({
+                  completed: cleaned.exit !== undefined && Exit.isSuccess(cleaned.exit),
+                  exit: cleaned.exit?._tag ?? "Pending",
+                }));
+                if (cleaned.exit === undefined || Exit.isFailure(cleaned.exit)) {
+                  return yield* Effect.die(
+                    new StopProgressInconclusive({ stage: "cleanup", schedulerRounds: maxSchedulerRounds }),
+                  );
+                }
+              }).pipe(Effect.orDie),
+            ),
+            Effect.onExit((exit) => Effect.sync(() => {
+              const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+              console.error("DG04_STOP_VERDICT", JSON.stringify({
+                scenario,
+                status: Exit.isSuccess(exit)
+                  ? "PASS_THIS_INTERLEAVING"
+                  : error instanceof StopProgressInconclusive
+                    ? "INCONCLUSIVE_NOT_QUALIFIED"
+                    : "FAIL",
+                tag: error instanceof StopProgressInconclusive ? error._tag : null,
+                stage: error instanceof StopProgressInconclusive ? error.stage : null,
+                cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : null,
+              }));
+            })),
+          ),
         {
           beforeProviderCall: (callType, target) =>
             target !== blockedThread || callType !== type
