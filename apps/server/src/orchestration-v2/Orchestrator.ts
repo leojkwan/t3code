@@ -70,6 +70,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -965,9 +966,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         );
         yield* admission;
-        return yield* work;
+        // Enter the admitted effect before another hold can acquire this lock,
+        // but let Stop commit while the provider is suspended on transport I/O.
+        // This child belongs to the worker fiber, so outbox cancellation also
+        // interrupts it; it is never detached or replayed after admission.
+        return yield* Effect.forkChild(work, { startImmediately: true });
       }),
     ).pipe(
+      Effect.flatMap((fiber) => Fiber.join(fiber)),
       Effect.mapError((cause) =>
         Schema.is(OrchestratorProjectionError)(cause)
           ? new GoalHold.GoalProviderDispatchError({ threadId: input.threadId, cause })
@@ -9220,6 +9226,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         );
       if (projection.thread.deletedAt !== null) return undefined;
+      const cancelProviderWork = {
+        effectTypes: ["provider-turn.start", "provider-turn.restart", "provider-turn.steer"],
+        reason: `Thread ${command.threadId} was stopped during provider dispatch.`,
+      } satisfies {
+        readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+        readonly reason: string;
+      };
       // Queued messages never started and cannot own background work.
       const latestRun = projection.runs.findLast((run) => run.status !== "queued");
       const target =
@@ -9259,7 +9272,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const enqueued = yield* Ref.get(interruptEffects);
           yield* Ref.update(events, (existing) => [...existing, ...written]);
           yield* Ref.update(effects, (existing) => [...existing, ...enqueued]);
-          return interrupted.value;
+          // Pending start/restart/steer I/O must lose the worker's cancellation
+          // race after this Stop commits, independently of the provider reply.
+          return cancelProviderWork;
         }
         yield* Effect.logWarning("thread.stop could not interrupt the running turn", {
           threadId: command.threadId,
@@ -9279,7 +9294,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* markStoppedRun({ command, events, thread: projection.thread, run, now });
       }
       yield* holdStoppedThread({ command, events, projection, cohortRunIds: [], now });
-      return undefined;
+      return cancelProviderWork;
     });
 
   const dispatchCheckpointRollback = (

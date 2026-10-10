@@ -31,12 +31,14 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -77,7 +79,10 @@ interface Stub {
   readonly events: Queue.Queue<ProviderAdapterV2Event>;
 }
 
-const makeStub = (cwd: string) =>
+const makeStub = (
+  cwd: string,
+  beforeProviderCall?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void>,
+) =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
     const started: ProviderAdapterV2TurnInput[] = [];
@@ -130,6 +135,7 @@ const makeStub = (cwd: string) =>
             startTurn: (turn) =>
               Effect.gen(function* () {
                 started.push(turn);
+                yield* beforeProviderCall?.("start", turn.threadId) ?? Effect.void;
                 yield* Queue.offer(events, {
                   type: "provider_turn.updated",
                   driver,
@@ -151,8 +157,9 @@ const makeStub = (cwd: string) =>
                 });
               }),
             steerTurn: (input) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 steered.push(input.message.messageId);
+                yield* beforeProviderCall?.("steer", input.threadId) ?? Effect.void;
               }),
             interruptTurn: (interrupt) =>
               Effect.sync(() => {
@@ -193,6 +200,10 @@ const heldQueueCheck = (obs: Observation, startsBeforeStop: number) =>
   obs.stubStarts === startsBeforeStop;
 
 interface PhaseOptions {
+  readonly beforeProviderCall?: (
+    type: "start" | "steer",
+    threadId: ThreadId,
+  ) => Effect.Effect<void>;
   readonly workspacePath?: string;
   // A second runtime over the same stored data: skip thread creation, own layer name.
   readonly existingThread?: boolean;
@@ -531,7 +542,7 @@ const withHarness = <A, E>(
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = options.workspacePath ?? (yield* checkpointWorkspace(name));
-      const stub = yield* makeStub(cwd);
+      const stub = yield* makeStub(cwd, options.beforeProviderCall);
       let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -669,9 +680,8 @@ const waitForRunning = (orchestrator: Orchestrator.OrchestratorV2Shape) =>
     Effect.forkScoped,
   );
 
-// F3: Stop while the stub is mid-call interrupts the turn, and the stub is asked
-// to start nothing afterward.
-it.effect("F3 thread.stop mid-call interrupts the active turn", () =>
+// F3: Stop an active turn after its provider start has returned.
+it.effect("F3 thread.stop interrupts an active turn after its start call returned", () =>
   withHarness("stop-f3", ({ orchestrator, worker, stub, threadId, observe, send }) =>
     Effect.gen(function* () {
       const running = yield* waitForRunning(orchestrator);
@@ -694,6 +704,122 @@ it.effect("F3 thread.stop mid-call interrupts the active turn", () =>
       assert.equal(stub.started.length, 1);
     }),
   ),
+);
+
+it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as const)(
+  "F3 pending provider $0 permits Stop before release",
+  (scenario) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const cancelled = yield* Deferred.make<void>();
+      const returned = yield* Deferred.make<void>();
+      const type = scenario.endsWith("steer") ? "steer" : "start";
+      const descendant = scenario.startsWith("descendant");
+      let blockedThread: ThreadId | undefined;
+      return yield* withHarness(
+        `pending-${scenario}`,
+        ({ orchestrator, worker, stub, threadId, sql }) =>
+          Effect.gen(function* () {
+            let target = threadId;
+            if (descendant || type === "steer") {
+              const running = yield* waitForRunning(orchestrator);
+              yield* orchestrator.dispatch(messageCommand(threadId, `${scenario}-first`));
+              yield* worker.drain();
+              yield* Fiber.join(running);
+            }
+            if (descendant) {
+              const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+              yield* orchestrator.dispatch({
+                type: "delegated_task.request",
+                commandId: CommandId.make(`${scenario}-child`),
+                parentThreadId: threadId,
+                parentRunId: parent.id,
+                parentNodeId: parent.rootNodeId!,
+                task: "inert pending provider child",
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                createdBy: "agent",
+                creationSource: "mcp",
+              });
+              target = (yield* orchestrator.getThreadProjection(threadId)).subagents[0]!
+                .childThreadId!;
+              if (type === "steer") {
+                const running = yield* waitForRunning(orchestrator);
+                yield* worker.drain();
+                yield* Fiber.join(running);
+              }
+            }
+            blockedThread = target;
+            if (type === "steer") {
+              const run = (yield* orchestrator.getThreadProjection(target)).runs[0]!;
+              yield* orchestrator.dispatch({
+                ...messageCommand(target, `${scenario}-pending`),
+                dispatchMode: { type: "steer_active", targetRunId: run.id },
+              });
+            } else if (!descendant) {
+              yield* orchestrator.dispatch(messageCommand(target, `${scenario}-pending`));
+            }
+            const executing = yield* worker.drain().pipe(Effect.forkScoped);
+            yield* Deferred.await(entered);
+            const starts = stub.started.length;
+            const steers = stub.steered.length;
+            const stopCommand = {
+              type: "thread.stop" as const,
+              commandId: CommandId.make(`${scenario}-stop`),
+              threadId: target,
+            };
+            const stopping = yield* Effect.gen(function* () {
+              if (descendant) {
+                // The child's suspended call must not block controls on its root.
+                yield* orchestrator.dispatch({
+                  type: "goal.hold",
+                  commandId: CommandId.make(`${scenario}-root-hold`),
+                  threadId,
+                  hold: "stop-pending-descendant",
+                });
+              }
+              return yield* orchestrator.dispatch(stopCommand);
+            }).pipe(Effect.timeout("1 second"), Effect.forkScoped);
+            yield* TestClock.adjust("1 second");
+            const stopped = yield* Fiber.await(stopping);
+            assert.isTrue(Exit.isSuccess(stopped), "Stop must commit before provider release");
+            assert.isFalse(yield* Deferred.isDone(release));
+            const rows = yield* sql<{ status: string }>`
+              SELECT status FROM orchestration_v2_effect_outbox
+              WHERE thread_id = ${target}
+                AND effect_type = ${`provider-turn.${type}`}
+                AND status = 'cancelled'
+            `;
+            assert.equal(rows.length, 1, "The pending provider effect must be durably cancelled");
+            yield* Fiber.join(executing);
+            assert.isTrue(yield* Deferred.isDone(cancelled));
+            assert.isFalse(yield* Deferred.isDone(returned));
+            // Replaying the same Stop receipt must not create another provider call.
+            yield* orchestrator.dispatch(stopCommand);
+            yield* worker.drain();
+            assert.equal(stub.started.length, starts);
+            assert.equal(stub.steered.length, steers);
+            const projection = yield* orchestrator.getThreadProjection(target);
+            assert.equal(projection.runs.at(-1)?.status, "interrupted");
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined))),
+        {
+          beforeProviderCall: (callType, target) =>
+            target !== blockedThread || callType !== type
+              ? Effect.void
+              : Effect.gen(function* () {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release).pipe(
+                    Effect.onInterrupt(() =>
+                      Deferred.succeed(cancelled, undefined).pipe(Effect.asVoid),
+                    ),
+                  );
+                  yield* Deferred.succeed(returned, undefined);
+                }),
+        },
+      );
+    }),
 );
 
 // F2 (existing per-run hold): a queued follow-up stays queued and held after Stop,
