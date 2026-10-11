@@ -732,6 +732,9 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       let executingFiber: Fiber.Fiber<unknown, unknown> | undefined;
       // A fixed work bound, not a latency target. Never advance time to judge progress.
       const maxSchedulerRounds = 256;
+      let inspectSetupExhaustion:
+        | ((workerFiber: Fiber.Fiber<unknown, unknown>) => Effect.Effect<void>)
+        | undefined;
       const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) =>
         Effect.gen(function* () {
           for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
@@ -745,6 +748,9 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
         Effect.gen(function* () {
           const progress = yield* pollFrozen(fiber);
           if (progress.exit === undefined) {
+            if (stage === "setup-worker" && inspectSetupExhaustion !== undefined) {
+              yield* inspectSetupExhaustion(fiber);
+            }
             return yield* Effect.fail(
               new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }),
             );
@@ -760,10 +766,82 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
         `pending-${scenario}`,
         ({ orchestrator, worker, stub, threadId, sql, executor }) =>
           Effect.gen(function* () {
+            const setupInspector = (
+              observedThreadId: ThreadId,
+              runningFiber: Fiber.Fiber<unknown, unknown>,
+            ) => (workerFiber: Fiber.Fiber<unknown, unknown>) =>
+              Effect.gen(function* () {
+                const clockAtBound = DateTime.toEpochMillis(yield* DateTime.now);
+                const workerAtBound = yield* Effect.sync(() => workerFiber.pollUnsafe());
+                const runningAtBound = yield* Effect.sync(() => runningFiber.pollUnsafe());
+                const startsAtBound = stub.started.length;
+                const snapshot = yield* Effect.exit(runWithinBound(
+                  Effect.gen(function* () {
+                    const outbox = yield* sql<{
+                      effect_id: string;
+                      effect_type: string;
+                      status: string;
+                      attempt_count: number;
+                      last_error: string | null;
+                    }>`
+                      SELECT effect_id, effect_type, status, attempt_count, last_error
+                      FROM orchestration_v2_effect_outbox
+                      WHERE thread_id = ${observedThreadId}
+                      ORDER BY created_at, effect_id
+                    `;
+                    const projection = yield* orchestrator.getThreadProjection(observedThreadId);
+                    return {
+                      outbox,
+                      runs: projection.runs.map((run) => ({
+                        id: run.id,
+                        status: run.status,
+                        activeAttemptId: run.activeAttemptId,
+                      })),
+                      providerThreads: projection.providerThreads.map((thread) => ({
+                        id: thread.id,
+                        status: thread.status,
+                        providerSessionId: thread.providerSessionId,
+                      })),
+                      providerTurns: projection.providerTurns.map((turn) => ({
+                        id: turn.id,
+                        status: turn.status,
+                        runAttemptId: turn.runAttemptId,
+                      })),
+                      activeKeys: yield* executor.activeKeys,
+                    };
+                  }),
+                  "setup-snapshot",
+                ));
+                const clockAfterSnapshot = DateTime.toEpochMillis(yield* DateTime.now);
+                const runningAfterSnapshot = yield* Effect.sync(() => runningFiber.pollUnsafe());
+                const workerAfterSnapshot = yield* Effect.sync(() => workerFiber.pollUnsafe());
+                console.error("DG04_SETUP_WORKER_SNAPSHOT", JSON.stringify({
+                  scenario,
+                  stage: "setup-worker",
+                  threadId: observedThreadId,
+                  schedulerRounds: maxSchedulerRounds,
+                  snapshotSchedulerBound: maxSchedulerRounds,
+                  snapshotStatus: Exit.isSuccess(snapshot) ? "OBSERVED" : "UNAVAILABLE_NOT_QUALIFIED",
+                  snapshotCause: Exit.isFailure(snapshot) ? Cause.pretty(snapshot.cause) : null,
+                  clockAtBound,
+                  clockAfterSnapshot,
+                  clockPreserved: clockAtBound === clockAfterSnapshot,
+                  stubStartedAtBound: startsAtBound,
+                  stubStartedAfterSnapshot: stub.started.length,
+                  workerFiberId: workerFiber.id,
+                  workerExitAtBound: workerAtBound?._tag ?? "Pending",
+                  workerExitAfterSnapshot: workerAfterSnapshot?._tag ?? "Pending",
+                  runningEventFiberId: runningFiber.id,
+                  runningEventExitAtBound: runningAtBound?._tag ?? "Pending",
+                  runningEventExitAfterSnapshot: runningAfterSnapshot?._tag ?? "Pending",
+                  snapshot: Exit.isSuccess(snapshot) ? snapshot.value : null,
+                }));
+              });
             let target = threadId;
             if (descendant || type === "steer") {
               const running = yield* waitForRunning(orchestrator);
               yield* orchestrator.dispatch(messageCommand(threadId, `${scenario}-first`));
+              inspectSetupExhaustion = setupInspector(threadId, running);
               yield* runWithinBound(worker.drain(), "setup-worker");
               yield* finishWithinBound(running, "setup-running-event");
             }
@@ -786,6 +864,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                 .childThreadId!;
               if (type === "steer") {
                 const running = yield* waitForRunning(orchestrator);
+                inspectSetupExhaustion = setupInspector(target, running);
                 yield* runWithinBound(worker.drain(), "setup-worker");
                 yield* finishWithinBound(running, "setup-running-event");
               }
