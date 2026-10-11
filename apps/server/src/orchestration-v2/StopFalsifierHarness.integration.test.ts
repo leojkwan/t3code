@@ -95,7 +95,7 @@ const makeStub = (
     turn: ProviderAdapterV2TurnInput,
     emitTerminal: Effect.Effect<void>,
   ) => Effect.Effect<void>,
-  afterProviderPreparation?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void>,
+  afterProviderPreparation?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void, Error>,
   onStartContinuationInterrupted?: (threadId: ThreadId) => Effect.Effect<void>,
 ) =>
   Effect.gen(function* () {
@@ -282,7 +282,7 @@ interface PhaseOptions {
   ) => Effect.Effect<void>;
   readonly afterProviderPreparation?: (
     type: "start" | "steer", threadId: ThreadId,
-  ) => Effect.Effect<void>;
+  ) => Effect.Effect<void, Error>;
   readonly onStartContinuationInterrupted?: (threadId: ThreadId) => Effect.Effect<void>;
   readonly workspacePath?: string;
   // A second runtime over the same stored data: skip thread creation, own layer name.
@@ -3062,6 +3062,394 @@ it.effect("F2-delegate root hold covers existing and future delegated descendant
       assert.equal(stub.started.length, 2);
     }),
   ),
+);
+
+it.effect("F4 entered provider-start failure is journaled once without replaying its admission", () =>
+  Effect.gen(function* () {
+    const maxSchedulerRounds = 256;
+    const ownedThread = ThreadId.make("thread:error-after-entry");
+    const enteredPreparation = yield* Deferred.make<void>();
+    const releasePreparation = yield* Deferred.make<void>();
+    const faultMessage = "DG04_INERT_POST_ENTRY_START_FAILURE";
+    let workEntries = 0;
+    let interruptions = 0;
+    let order = 0;
+    let overflow = false;
+    let sourceAssertionsComplete = false;
+    let executing: Fiber.Fiber<unknown, unknown> | undefined;
+    let workExit: Exit.Exit<void, Error> | undefined;
+    let workEntryOrder: number | undefined;
+    let workFailureOrder: number | undefined;
+    let originalBinding: {
+      effectId: string; attemptCount: number; leaseOwner: string;
+      runId: string; attemptId: string; providerThreadId: string;
+    } | undefined;
+    const gate: Array<ProviderReplayHarness.ProviderDispatchObservation & { order: number }> = [];
+    const observeGate = (observation: ProviderReplayHarness.ProviderDispatchObservation) => {
+      if (observation.threadId !== ownedThread) return;
+      if (gate.length === maxSchedulerRounds) { overflow = true; return; }
+      gate.push({ ...observation, order: ++order });
+    };
+    const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) => Effect.gen(function* () {
+      for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
+        const exit = yield* Effect.sync(() => fiber.pollUnsafe());
+        if (exit !== undefined) return { exit, rounds };
+        if (rounds < maxSchedulerRounds) yield* Effect.yieldNow;
+      }
+      return { exit: undefined, rounds: maxSchedulerRounds };
+    });
+    const bounded = <A, E, R>(work: Effect.Effect<A, E, R>, stage: string) =>
+      Effect.gen(function* () {
+        const fiber = yield* work.pipe(Effect.forkScoped);
+        const progress = yield* pollFrozen(fiber);
+        if (progress.exit === undefined) return yield* Effect.fail(
+          new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }));
+        return yield* progress.exit;
+      });
+    yield* withHarness("error-after-entry", ({ orchestrator, worker, threadId, sql, stub, executor }) =>
+      Effect.gen(function* () {
+        assert.equal(threadId, ownedThread);
+        const snapshot = () => Effect.gen(function* () {
+          const effects = yield* sql<{
+            effect_id: string; thread_id: string; effect_type: string; attempt_count: number;
+            status: string; lease_owner: string | null; lease_expires_at: string | null;
+            last_error: string | null; available_at: string; completed_at: string | null;
+          }>`SELECT effect_id, thread_id, effect_type, attempt_count, status, lease_owner,
+               lease_expires_at, last_error, available_at, completed_at
+             FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+               AND effect_type IN ('provider-turn.start', 'provider-turn.steer', 'provider-turn.restart')
+             ORDER BY effect_id LIMIT 257`;
+          const policies = yield* sql<{
+            sequence: number; command_id: string | null; hold: string | null;
+            request_limit: number | null; used: number; grant_id: string | null;
+          }>`SELECT sequence, command_id, json_extract(payload_json, '$.hold') AS hold,
+               json_extract(payload_json, '$.limit') AS request_limit,
+               json_extract(payload_json, '$.used') AS used, json_extract(payload_json, '$.grant') AS grant_id
+             FROM orchestration_events WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+               AND event_type = 'goal.dispatch-policy.updated' ORDER BY sequence LIMIT 257`;
+          const admissions = yield* sql<{
+            command_id: string; status: string; result_sequence: number;
+          }>`SELECT command_id, status, result_sequence FROM orchestration_command_receipts
+             WHERE aggregate_id = ${threadId} AND command_type = 'goal.provider-dispatch'
+             ORDER BY command_id LIMIT 257`;
+          const controls = yield* sql<{
+            command_id: string; command_type: string; status: string; result_sequence: number;
+          }>`SELECT command_id, command_type, status, result_sequence FROM orchestration_command_receipts
+             WHERE aggregate_id = ${threadId}
+               AND command_type IN ('thread.stop', 'run.interrupt', 'goal.hold', 'goal.resume', 'goal.budget.set')
+             ORDER BY command_id LIMIT 257`;
+          const journal = yield* sql<{
+            sequence: number; event_id: string; command_id: string | null;
+            event_type: string; payload_json: string;
+          }>`SELECT sequence, event_id, command_id, event_type, payload_json FROM orchestration_events
+             WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+               AND event_type IN ('run-attempt.updated', 'run.updated', 'turn-item.updated')
+             ORDER BY sequence LIMIT 257`;
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          if ([effects, policies, admissions, controls, journal, projection.runs,
+            projection.attempts, projection.providerThreads, projection.turnItems]
+            .some((rows) => rows.length > maxSchedulerRounds)) return yield* Effect.fail(
+              new StopProgressInconclusive({ stage: "error-after-entry-snapshot-overflow", schedulerRounds: maxSchedulerRounds }));
+          return { effects, policies, admissions, controls, journal,
+            runs: projection.runs.map((run) => ({ id: run.id, status: run.status,
+              activeAttemptId: run.activeAttemptId, rootNodeId: run.rootNodeId })),
+            attempts: projection.attempts.map((attempt) => ({ id: attempt.id,
+              runId: attempt.runId, status: attempt.status, providerTurnId: attempt.providerTurnId })),
+            sessions: projection.providerThreads.map((thread) => ({ id: thread.id, sessionId: thread.providerSessionId })),
+            errors: projection.turnItems.filter((item) => item.type === "error").map((item) => ({
+              id: item.id, runId: item.runId, nodeId: item.nodeId, providerThreadId: item.providerThreadId,
+              providerTurnId: item.providerTurnId, status: item.status, failure: item.failure,
+            })),
+            adapterEntries: stub.started.length, providerInterruptCalls: stub.interrupts.length,
+            workEntries, interruptions, activeKeys: yield* executor.activeKeys,
+            clock: DateTime.toEpochMillis(yield* DateTime.now) };
+        });
+        const command = messageCommand(threadId, "error-after-entry-start");
+        const accepted = yield* bounded(orchestrator.dispatch(command), "error-after-entry-dispatch");
+        const commandReceipt = yield* bounded(sql<{
+          command_id: string; aggregate_id: string; command_type: string;
+          status: string; result_sequence: number; error: string | null;
+        }>`SELECT command_id, aggregate_id, command_type, status, result_sequence, error
+           FROM orchestration_command_receipts WHERE command_id = ${command.commandId}`,
+          "error-after-entry-command-receipt");
+        assert.equal(commandReceipt.length, 1);
+        assert.equal(commandReceipt[0]!.command_id, command.commandId);
+        assert.equal(commandReceipt[0]!.aggregate_id, threadId);
+        assert.equal(commandReceipt[0]!.command_type, "message.dispatch");
+        assert.equal(commandReceipt[0]!.status, "accepted");
+        assert.equal(commandReceipt[0]!.result_sequence, accepted.sequence);
+        assert.isNull(commandReceipt[0]!.error);
+        executing = yield* worker.drain().pipe(Effect.forkScoped);
+        yield* bounded(Deferred.await(enteredPreparation), "error-after-entry-preparation");
+        const before = yield* bounded(snapshot(), "error-after-entry-admitted-snapshot");
+        assert.equal(before.effects.length, 1);
+        assert.equal(before.runs.length, 1);
+        assert.equal(before.attempts.length, 1);
+        assert.equal(before.admissions.length, 1);
+        assert.equal(before.adapterEntries, 1);
+        assert.equal(before.workEntries, 0);
+        assert.deepEqual(before.errors, []);
+        assert.deepEqual(before.controls, []);
+        const original = before.effects[0]!;
+        assert.equal(original.effect_type, "provider-turn.start");
+        assert.equal(original.status, "running");
+        assert.equal(original.attempt_count, 1);
+        if (original.lease_owner === null) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "error-after-entry-original-lease-unavailable", schedulerRounds: maxSchedulerRounds,
+        }));
+        assert.isNotNull(original.lease_expires_at);
+        assert.isNull(original.last_error);
+        assert.equal(before.runs[0]!.status, "running");
+        assert.equal(before.attempts[0]!.status, "running");
+        assert.equal(before.runs[0]!.activeAttemptId, before.attempts[0]!.id);
+        assert.equal(before.attempts[0]!.runId, before.runs[0]!.id);
+        assert.equal(before.admissions[0]!.command_id,
+          `goal-provider:${original.effect_id}:${original.attempt_count}`);
+        assert.equal(before.admissions[0]!.status, "accepted");
+        assert.isTrue(accepted.sequence < before.admissions[0]!.result_sequence);
+        originalBinding = { effectId: original.effect_id, attemptCount: original.attempt_count,
+          leaseOwner: original.lease_owner, runId: before.runs[0]!.id,
+          attemptId: before.attempts[0]!.id, providerThreadId: stub.started[0]!.providerThread.id };
+        assert.equal(stub.started[0]!.runId, originalBinding.runId);
+        assert.equal(stub.started[0]!.attemptId, originalBinding.attemptId);
+        const initialPolicy = before.policies.at(-1)!;
+        assert.isDefined(initialPolicy);
+        assert.isNull(initialPolicy.hold);
+        assert.equal(initialPolicy.used, 1);
+        const budget = (policy: typeof initialPolicy) =>
+          ({ used: policy.used, limit: policy.request_limit, grant: policy.grant_id });
+        const assertCommon = (state: typeof before,
+          expectedPolicies = before.policies, expectedControls = before.controls) => {
+          assert.equal(state.clock, 0);
+          assert.equal(state.interruptions, 0);
+          assert.equal(state.providerInterruptCalls, 0);
+          assert.deepEqual(state.controls, expectedControls);
+          assert.deepEqual(state.admissions, before.admissions);
+          assert.deepEqual(state.policies, expectedPolicies);
+          assert.deepEqual(budget(state.policies.at(-1)!), budget(initialPolicy));
+          assert.equal(state.adapterEntries, 1);
+          assert.deepEqual(state.runs.map(({ status, activeAttemptId, ...identity }) => identity),
+            before.runs.map(({ status, activeAttemptId, ...identity }) => identity));
+          assert.deepEqual(state.attempts.map(({ status, ...identity }) => identity),
+            before.attempts.map(({ status, ...identity }) => identity));
+          assert.deepEqual(state.sessions, before.sessions);
+        };
+        assertCommon(before);
+        console.error("DG04_ERROR_AFTER_ENTRY_ADMITTED", JSON.stringify({
+          commandReceipt, before, originalBinding, gate: gate.slice(), maxSchedulerRounds,
+          retryPolicyBasis: "Existing EffectWorker.layer default maxAttempts5; no override",
+        }));
+        yield* Deferred.succeed(releasePreparation, undefined);
+        const completed = yield* pollFrozen(executing!);
+        const after = yield* bounded(snapshot(), "error-after-entry-settled-snapshot");
+        console.error("DG04_ERROR_AFTER_ENTRY_SETTLED", JSON.stringify({
+          after, workerExit: completed.exit?._tag ?? "Pending", schedulerRounds: completed.rounds,
+          workExit: workExit?._tag ?? "Pending", workEntryOrder: workEntryOrder ?? null,
+          workFailureOrder: workFailureOrder ?? null, gate: gate.slice(), overflow, maxSchedulerRounds,
+        }));
+        if (completed.exit === undefined || workExit === undefined || workEntryOrder === undefined ||
+            workFailureOrder === undefined || overflow) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "error-after-entry-progress-witness", schedulerRounds: maxSchedulerRounds,
+        }));
+        assert.isTrue(Exit.isFailure(workExit));
+        if (!Exit.isFailure(workExit)) return yield* Effect.die("The entered work did not fail");
+        const failure = Cause.squash(workExit.cause);
+        assert.instanceOf(failure, Error);
+        if (!(failure instanceof Error)) return yield* Effect.die("The entered failure was not the injected Error");
+        assert.equal(failure.message, faultMessage);
+        assert.isTrue(Exit.isSuccess(completed.exit));
+        assertCommon(after);
+        assert.equal(after.workEntries, 1);
+        assert.deepEqual(after.activeKeys, []);
+        assert.equal(after.runs[0]!.status, "failed");
+        assert.equal(after.attempts[0]!.status, "failed");
+        assert.equal(after.effects.length, 1);
+        const settled = after.effects[0]!;
+        assert.equal(settled.effect_id, original.effect_id);
+        assert.equal(settled.thread_id, original.thread_id);
+        assert.equal(settled.effect_type, original.effect_type);
+        assert.equal(settled.attempt_count, 1);
+        // The real start handler journals terminal failure and returns success.
+        // This is not a non-retryable classification of an outbox execution failure.
+        assert.equal(settled.status, "succeeded");
+        assert.isNull(settled.lease_owner);
+        assert.isNull(settled.lease_expires_at);
+        assert.isNotNull(settled.completed_at);
+        assert.isNull(settled.last_error);
+        const sameAttemptGate = gate.filter((o) => o.effectId === original.effect_id &&
+          o.attemptCount === original.attempt_count && o.threadId === threadId);
+        assert.deepEqual(sameAttemptGate.map((o) => o.phase), ["enter", "enter", "failure", "failure"]);
+        assert.equal(sameAttemptGate[1]!.continuation?.leaseOwner, original.lease_owner);
+        assert.equal(sameAttemptGate[2]!.continuation?.leaseOwner, original.lease_owner);
+        assert.equal(sameAttemptGate[3]!.errorTag, "ProviderAdapterTurnStartError");
+        assert.isUndefined(sameAttemptGate[3]!.continuation);
+        assert.isTrue(sameAttemptGate[1]!.order < workEntryOrder);
+        assert.isTrue(workEntryOrder < workFailureOrder);
+        assert.isTrue(workFailureOrder < sameAttemptGate[2]!.order);
+        assert.isTrue(sameAttemptGate[2]!.order < sameAttemptGate[3]!.order);
+        const newEvents = after.journal.filter((event) => event.sequence > before.admissions[0]!.result_sequence)
+          .map((event) => ({ ...event, payload: JSON.parse(event.payload_json) }));
+        const failedAttempts = newEvents.filter((event) => event.event_type === "run-attempt.updated" &&
+          event.payload.id === originalBinding!.attemptId && event.payload.status === "failed");
+        const errorEvents = newEvents.filter((event) => event.event_type === "turn-item.updated" &&
+          event.payload.type === "error" && event.payload.runId === originalBinding!.runId);
+        const failedRuns = newEvents.filter((event) => event.event_type === "run.updated" &&
+          event.payload.id === originalBinding!.runId && event.payload.status === "failed");
+        assert.equal(failedAttempts.length, 1);
+        assert.equal(errorEvents.length, 1);
+        assert.equal(failedRuns.length, 1);
+        assert.equal(failedAttempts[0]!.payload.runId, originalBinding.runId);
+        const errorEvent = errorEvents[0]!;
+        assert.isTrue(failedAttempts[0]!.sequence < errorEvent.sequence);
+        assert.isTrue(errorEvent.sequence < failedRuns[0]!.sequence);
+        assert.equal(errorEvent.payload.status, "failed");
+        assert.equal(errorEvent.payload.nodeId, before.runs[0]!.rootNodeId);
+        assert.equal(errorEvent.payload.providerThreadId, originalBinding.providerThreadId);
+        assert.equal(errorEvent.payload.failure.class, "provider_error");
+        assert.equal(errorEvent.payload.failure.message,
+          "The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.");
+        assert.isNull(errorEvent.payload.failure.retryable);
+        assert.equal(after.errors.length, 1);
+        assert.equal(after.errors[0]!.id, errorEvent.payload.id);
+        assert.equal(after.errors[0]!.runId, originalBinding.runId);
+        assert.equal(after.errors[0]!.providerThreadId, originalBinding.providerThreadId);
+        assert.equal(after.errors[0]!.providerTurnId, errorEvent.payload.providerTurnId);
+        assert.deepEqual(after.errors[0]!.failure, errorEvent.payload.failure);
+        const next = yield* bounded(worker.nextClaimableAt, "error-after-entry-next-claimable");
+        assert.isTrue(Option.isNone(next));
+        const gateBeforeReplay = gate.slice();
+        const replay = yield* bounded(orchestrator.dispatch(command), "error-after-entry-exact-replay");
+        yield* bounded(worker.drain(), "error-after-entry-replay-drain");
+        const afterReplay = yield* bounded(snapshot(), "error-after-entry-replay-snapshot");
+        console.error("DG04_ERROR_AFTER_ENTRY_REPLAY", JSON.stringify({
+          after, afterReplay, originalSequence: accepted.sequence, replaySequence: replay.sequence,
+          originalBinding, errorEvent, failedAttemptEvent: failedAttempts[0], failedRunEvent: failedRuns[0],
+          gate, workEntryOrder, workFailureOrder, nextClaimable: next._tag, overflow, maxSchedulerRounds,
+        }));
+        assert.equal(replay.sequence, accepted.sequence);
+        assert.deepEqual(afterReplay, after);
+        assert.deepEqual(gate, gateBeforeReplay);
+        assertCommon(afterReplay);
+        assert.equal(workEntries, 1);
+        assert.isFalse(overflow);
+        // A real resume with the already-clear hold must not revive this failed attempt.
+        const resumeCommand = { type: "goal.resume" as const, threadId,
+          commandId: CommandId.make("error-after-entry-resume") };
+        const resumed = yield* bounded(orchestrator.dispatch(resumeCommand), "error-after-entry-resume");
+        const resumeReceipt = yield* bounded(sql<{
+          command_id: string; aggregate_id: string; command_type: string;
+          status: string; result_sequence: number; error: string | null;
+        }>`SELECT command_id, aggregate_id, command_type, status, result_sequence, error
+           FROM orchestration_command_receipts WHERE command_id = ${resumeCommand.commandId}`,
+          "error-after-entry-resume-receipt");
+        assert.equal(resumeReceipt.length, 1);
+        assert.equal(resumeReceipt[0]!.command_id, resumeCommand.commandId);
+        assert.equal(resumeReceipt[0]!.aggregate_id, threadId);
+        assert.equal(resumeReceipt[0]!.command_type, "goal.resume");
+        assert.equal(resumeReceipt[0]!.status, "accepted");
+        assert.equal(resumeReceipt[0]!.result_sequence, resumed.sequence);
+        assert.isNull(resumeReceipt[0]!.error);
+        assert.isTrue(resumed.sequence > failedRuns[0]!.sequence);
+        yield* bounded(worker.drain(), "error-after-entry-resume-drain");
+        const afterRelease = yield* bounded(snapshot(), "error-after-entry-released-snapshot");
+        assert.equal(afterRelease.policies.length, before.policies.length + 1);
+        assert.deepEqual(afterRelease.policies.slice(0, -1), before.policies);
+        const resumePolicy = afterRelease.policies.at(-1)!;
+        assert.equal(resumePolicy.command_id, resumeCommand.commandId);
+        assert.equal(resumePolicy.sequence, resumed.sequence);
+        assert.isNull(resumePolicy.hold);
+        assert.deepEqual(budget(resumePolicy), budget(initialPolicy));
+        const expectedResumeControls = [{ command_id: resumeCommand.commandId,
+          command_type: "goal.resume", status: "accepted", result_sequence: resumed.sequence }];
+        assertCommon(afterRelease, afterRelease.policies, expectedResumeControls);
+        for (const key of ["effects", "runs", "attempts", "sessions", "errors", "journal", "activeKeys"] as const) {
+          assert.deepEqual(afterRelease[key], after[key]);
+        }
+        assert.equal(afterRelease.workEntries, 1);
+        assert.deepEqual(gate, gateBeforeReplay);
+        const repeatedStart = yield* bounded(orchestrator.dispatch(command), "error-after-entry-start-after-release-replay");
+        const repeatedResume = yield* bounded(orchestrator.dispatch(resumeCommand), "error-after-entry-resume-replay");
+        yield* bounded(worker.drain(), "error-after-entry-release-replay-drain");
+        const afterReleaseReplay = yield* bounded(snapshot(), "error-after-entry-release-replay-snapshot");
+        const nextAfterRelease = yield* bounded(worker.nextClaimableAt, "error-after-entry-released-next-claimable");
+        console.error("DG04_ERROR_AFTER_ENTRY_RELEASED_REPLAY", JSON.stringify({
+          resumeReceipt, resumePolicy, afterRelease, afterReleaseReplay,
+          originalSequence: accepted.sequence, originalReplaySequence: repeatedStart.sequence,
+          releaseSequence: resumed.sequence, releaseReplaySequence: repeatedResume.sequence,
+          originalBinding, gate, workEntries, nextClaimable: nextAfterRelease._tag,
+          overflow, maxSchedulerRounds,
+        }));
+        assert.equal(repeatedStart.sequence, accepted.sequence);
+        assert.equal(repeatedResume.sequence, resumed.sequence);
+        assert.deepEqual(afterReleaseReplay, afterRelease);
+        assert.deepEqual(gate, gateBeforeReplay);
+        assertCommon(afterReleaseReplay, afterRelease.policies, expectedResumeControls);
+        assert.equal(workEntries, 1);
+        assert.isTrue(Option.isNone(nextAfterRelease));
+        assert.isFalse(overflow);
+        sourceAssertionsComplete = true;
+      }).pipe(Effect.ensuring(Effect.gen(function* () {
+        const cleanup = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(releasePreparation, undefined);
+          if (executing !== undefined) yield* Fiber.interrupt(executing);
+        }).pipe(Effect.forkScoped);
+        const joined = yield* pollFrozen(cleanup);
+        console.error("DG04_ERROR_AFTER_ENTRY_CLEANUP", JSON.stringify({
+          completed: joined.exit !== undefined && Exit.isSuccess(joined.exit),
+          exit: joined.exit?._tag ?? "Pending", workEntries, interruptions, sourceAssertionsComplete,
+        }));
+        if (joined.exit === undefined || Exit.isFailure(joined.exit)) return yield* Effect.die(
+          new StopProgressInconclusive({ stage: "error-after-entry-cleanup", schedulerRounds: maxSchedulerRounds }));
+        if (sourceAssertionsComplete) {
+          assert.equal(workEntries, 1);
+          assert.equal(interruptions, 0);
+        }
+      }).pipe(Effect.orDie))),
+      {
+        captureBaseline: Effect.void,
+        checkpointRepositoryCheck: () => Effect.succeed(false),
+        observeProviderDispatch: observeGate,
+        beforeProviderCall: (type, threadId) => Effect.gen(function* () {
+          assert.equal(type, "start");
+          assert.equal(threadId, ownedThread);
+          yield* Deferred.succeed(enteredPreparation, undefined);
+          yield* Deferred.await(releasePreparation);
+        }),
+        afterProviderPreparation: (type, threadId) => Effect.gen(function* () {
+          assert.equal(type, "start");
+          assert.equal(threadId, ownedThread);
+          if (originalBinding === undefined) return yield* Effect.fail(new StopProgressInconclusive({
+            stage: "error-after-entry-original-binding-unavailable", schedulerRounds: maxSchedulerRounds,
+          }));
+          workEntries += 1;
+          workEntryOrder = ++order;
+          console.error("DG04_ERROR_AFTER_ENTRY_WORK_ENTERED", JSON.stringify({
+            originalBinding, workEntries, workEntryOrder, gate: gate.slice(), maxSchedulerRounds,
+          }));
+          return yield* Effect.fail(new Error(faultMessage));
+        }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+          workExit = exit;
+          workFailureOrder = ++order;
+          console.error("DG04_ERROR_AFTER_ENTRY_WORK_EXIT", JSON.stringify({
+            originalBinding, exit: exit._tag, workEntries, workEntryOrder, workFailureOrder,
+            cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : null,
+            maxSchedulerRounds,
+          }));
+        }))),
+        onStartContinuationInterrupted: (threadId) => Effect.sync(() => {
+          if (threadId === ownedThread) interruptions += 1;
+        }),
+      },
+    );
+  }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+    const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+    console.error("DG04_ERROR_AFTER_ENTRY_VERDICT", JSON.stringify({
+      status: Exit.isSuccess(exit) ? "PASS_HANDLED_PROVIDER_START_FAILURE"
+        : error instanceof StopProgressInconclusive ? "INCONCLUSIVE_NOT_QUALIFIED" : "FAIL",
+      stage: error instanceof StopProgressInconclusive ? error.stage : null,
+      cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : null,
+    }));
+  }))),
 );
 
 it.effect("F4 a hold queued before dispatch wins the root dispatch lock race", () =>
