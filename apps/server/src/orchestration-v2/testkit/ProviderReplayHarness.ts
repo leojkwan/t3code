@@ -244,6 +244,17 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
   return layerWithRegistry(scenario, layerRegistry, options);
 }
 
+export interface ProviderDispatchObservation {
+  readonly phase: "enter" | "return" | "failure";
+  readonly threadId: string;
+  readonly effectId: string;
+  readonly attemptCount: number;
+  readonly errorTag?: string | null;
+  readonly causeTag?: string | null;
+  readonly causeThreadId?: string | null;
+  readonly causeGoalThreadId?: string | null;
+}
+
 export interface InterruptPhaseObservation {
   readonly phase: "interrupt-enter" | "interrupt-exit" | "control-read-enter" | "control-read-exit";
   readonly exit?: "Success" | "Failure";
@@ -262,6 +273,8 @@ export function layerWithRegistry<Error>(
     readonly runEffectWorker?: boolean;
     // Optional synchronous observation only; original services and results are forwarded.
     readonly observeInterrupt?: (observation: InterruptPhaseObservation) => void;
+    // Test-owned observation of actual calls/results only; no extra gate invocation.
+    readonly observeProviderDispatch?: (observation: ProviderDispatchObservation) => void;
     // Optional setup fixture only; all other checkpoint consumers remain real.
     readonly captureBaseline?: Effect.Effect<void, CheckpointService.CheckpointServiceV2Error>;
     // Optional capability fixture; checkpoint metadata and persistence stay real.
@@ -498,8 +511,33 @@ export function layerWithRegistry<Error>(
   const layerThreadManagementProvided = Layer.unwrap(
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const observe = options.observeProviderDispatch;
+      const withProviderDispatch: Orchestrator.OrchestratorV2Shape["withProviderDispatch"] =
+        observe === undefined ? orchestrator.withProviderDispatch : (input, work) =>
+          Effect.suspend(() => {
+            observe({ ...input, phase: "enter" });
+            return orchestrator.withProviderDispatch(input, work).pipe(
+              Effect.tapError((error) => Effect.sync(() => {
+                const outer = typeof error === "object" && error !== null ? error : undefined;
+                const cause = outer !== undefined && "cause" in outer ? outer.cause : undefined;
+                const inner = typeof cause === "object" && cause !== null ? cause : undefined;
+                observe({
+                  ...input, phase: "failure",
+                  errorTag: outer !== undefined && "_tag" in outer && typeof outer._tag === "string"
+                    ? outer._tag : null,
+                  causeTag: inner !== undefined && "_tag" in inner && typeof inner._tag === "string"
+                    ? inner._tag : null,
+                  causeThreadId: inner !== undefined && "threadId" in inner && typeof inner.threadId === "string"
+                    ? inner.threadId : null,
+                  causeGoalThreadId: inner !== undefined && "goalThreadId" in inner && typeof inner.goalThreadId === "string"
+                    ? inner.goalThreadId : null,
+                });
+              })),
+              Effect.tap(() => Effect.sync(() => observe({ ...input, phase: "return" }))),
+            );
+          });
       return Layer.mock(ThreadManagementService.ThreadManagementService)({
-        withProviderDispatch: orchestrator.withProviderDispatch,
+        withProviderDispatch,
         dispatch: orchestrator.dispatch,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,

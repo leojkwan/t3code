@@ -255,6 +255,7 @@ interface PhaseOptions {
   readonly checkpointRepositoryCheck?: CheckpointStore.CheckpointStore["Service"]["isGitRepository"];
   readonly inspectSetupSpawner?: boolean;
   readonly observeInterrupt?: (observation: ProviderReplayHarness.InterruptPhaseObservation) => void;
+  readonly observeProviderDispatch?: (observation: ProviderReplayHarness.ProviderDispatchObservation) => void;
   readonly beforeProviderCall?: (
     type: "start" | "steer",
     threadId: ThreadId,
@@ -726,6 +727,7 @@ const withHarness = <A, E>(
                 ...(options.captureBaseline === undefined ? {} : { captureBaseline: options.captureBaseline }),
                 ...(options.checkpointRepositoryCheck === undefined ? {} : { checkpointRepositoryCheck: options.checkpointRepositoryCheck }),
                 ...(options.observeInterrupt === undefined ? {} : { observeInterrupt: options.observeInterrupt }),
+                ...(options.observeProviderDispatch === undefined ? {} : { observeProviderDispatch: options.observeProviderDispatch }),
               },
             );
             const management = ThreadManagementService.layer.pipe(Layer.provide(runtime));
@@ -819,6 +821,252 @@ class StopProgressInconclusive extends Data.TaggedError("StopProgressInconclusiv
     return `${this.stage}: finite scheduler work exhausted; INCONCLUSIVE / NOT QUALIFIED`;
   }
 }
+
+// A held attempt must stay resumable. The marker is after preparation, not adapter entry.
+it.effect("F4 preparation hold resumes the same admitted attempt exactly once after release", () =>
+  Effect.gen(function* () {
+    const maxSchedulerRounds = 256;
+    const entered = yield* Deferred.make<void>();
+    const preparationReady = yield* Deferred.make<void>();
+    const interrupted = yield* Deferred.make<void>();
+    let continuations = 0;
+    let ownedThread: ThreadId | undefined;
+    let executing: Fiber.Fiber<unknown, unknown> | undefined;
+    const gate: Array<ProviderReplayHarness.ProviderDispatchObservation & { order: number }> = [];
+    let overflow = false;
+    const observeGate = (observation: ProviderReplayHarness.ProviderDispatchObservation) => {
+      if (observation.threadId !== ownedThread) return;
+      if (gate.length === maxSchedulerRounds) { overflow = true; return; }
+      gate.push({ ...observation, order: gate.length + 1 });
+    };
+    const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) => Effect.gen(function* () {
+      for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
+        const exit = yield* Effect.sync(() => fiber.pollUnsafe());
+        if (exit !== undefined) return { exit, rounds };
+        if (rounds < maxSchedulerRounds) yield* Effect.yieldNow;
+      }
+      return { exit: undefined, rounds: maxSchedulerRounds };
+    });
+    const bounded = <A, E, R>(work: Effect.Effect<A, E, R>, stage: string) =>
+      Effect.gen(function* () {
+        const fiber = yield* work.pipe(Effect.forkScoped);
+        const progress = yield* pollFrozen(fiber);
+        if (progress.exit === undefined) return yield* Effect.fail(
+          new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }));
+        return yield* progress.exit;
+      });
+    yield* withHarness("hold-release", ({ orchestrator, worker, threadId, sql, stub }) =>
+      Effect.gen(function* () {
+        ownedThread = threadId;
+        const startCommand = messageCommand(threadId, "hold-release-start");
+        const started = yield* bounded(orchestrator.dispatch(startCommand), "start-dispatch");
+        executing = yield* worker.drain().pipe(Effect.forkScoped);
+        yield* bounded(Deferred.await(entered), "preparation-entered");
+        const claimed = yield* bounded(sql<{
+          effect_id: string; thread_id: string; effect_type: string;
+          attempt_count: number; status: string; lease_owner: string | null;
+        }>`SELECT effect_id, thread_id, effect_type, attempt_count, status, lease_owner
+           FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+             AND effect_type = 'provider-turn.start' AND status = 'running'`, "claimed-effect");
+        assert.equal(claimed.length, 1);
+        const exact = claimed[0]!;
+        const admissionId = `goal-provider:${exact.effect_id}:${exact.attempt_count}`;
+        const readCommand = (id: string) => sql<{
+          command_id: string; aggregate_id: string; command_type: string;
+          status: string; result_sequence: number; error: string | null;
+        }>`SELECT command_id, aggregate_id, command_type, status, result_sequence, error
+           FROM orchestration_command_receipts WHERE command_id = ${id}`;
+        const snapshot = () => Effect.gen(function* () {
+          const outbox = yield* sql<{
+            effect_id: string; thread_id: string; effect_type: string;
+            attempt_count: number; status: string; lease_owner: string | null;
+          }>`SELECT effect_id, thread_id, effect_type, attempt_count, status, lease_owner
+             FROM orchestration_v2_effect_outbox WHERE effect_id = ${exact.effect_id}`;
+          const policies = yield* sql<{
+            sequence: number; command_id: string | null; hold: string | null;
+            request_limit: number | null; used: number; grant_id: string | null;
+          }>`SELECT sequence, command_id, json_extract(payload_json, '$.hold') AS hold,
+               json_extract(payload_json, '$.limit') AS request_limit,
+               json_extract(payload_json, '$.used') AS used,
+               json_extract(payload_json, '$.grant') AS grant_id
+             FROM orchestration_events WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+               AND event_type = 'goal.dispatch-policy.updated' ORDER BY sequence LIMIT 257`;
+          if (policies.length > maxSchedulerRounds) return yield* Effect.fail(
+            new StopProgressInconclusive({ stage: "policy-observation-overflow", schedulerRounds: maxSchedulerRounds }));
+          const controls = yield* sql<{
+            command_id: string; command_type: string; status: string; result_sequence: number;
+          }>`SELECT command_id, command_type, status, result_sequence
+             FROM orchestration_command_receipts WHERE aggregate_id = ${threadId}
+               AND command_type IN ('thread.stop', 'run.interrupt', 'goal.budget.set')
+             ORDER BY command_id`;
+          const admission = yield* readCommand(admissionId);
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          return {
+            outbox, policies, controls, admission, continuations,
+            interrupted: yield* Deferred.isDone(interrupted),
+            providerInterruptCalls: stub.interrupts.length, adapterEntries: stub.started.length,
+            runIdentity: projection.runs.map((run) => ({ id: run.id, activeAttemptId: run.activeAttemptId })),
+            sessionIdentity: projection.providerThreads.map((thread) => ({ id: thread.id, sessionId: thread.providerSessionId })),
+            clock: DateTime.toEpochMillis(yield* DateTime.now),
+          };
+        });
+        const before = yield* bounded(snapshot(), "before-hold-snapshot");
+        assert.equal(before.clock, 0);
+        assert.equal(before.admission.length, 1);
+        assert.equal(before.admission[0]!.status, "accepted");
+        assert.equal(before.admission[0]!.command_type, "goal.provider-dispatch");
+        assert.equal(before.continuations, 0);
+        assert.isFalse(before.interrupted);
+        assert.equal(before.adapterEntries, 1);
+        const budget = (policy: (typeof before.policies)[number]) => ({
+          limit: policy.request_limit, used: policy.used, grant: policy.grant_id,
+        });
+        const initialPolicy = before.policies.at(-1)!;
+        assert.isDefined(initialPolicy);
+        assert.isNull(initialPolicy.hold);
+        const holdCommand = {
+          type: "goal.hold" as const, commandId: CommandId.make("hold-release-hold"),
+          threadId, hold: "preparation-hold",
+        };
+        const held = yield* bounded(orchestrator.dispatch(holdCommand), "hold-commit");
+        const holdReceipt = yield* bounded(readCommand(holdCommand.commandId), "hold-receipt");
+        assert.equal(holdReceipt.length, 1);
+        assert.equal(holdReceipt[0]!.command_type, "goal.hold");
+        assert.equal(holdReceipt[0]!.status, "accepted");
+        assert.equal(holdReceipt[0]!.result_sequence, held.sequence);
+        assert.isTrue(before.admission[0]!.result_sequence < held.sequence);
+        const afterHold = yield* bounded(snapshot(), "hold-snapshot");
+        assert.equal(afterHold.policies.at(-1)!.hold, "preparation-hold");
+        assert.equal(afterHold.continuations, 0);
+        // Preparation is now unconditionally ready while the REAL hold is still active.
+        // This fixture creates no refusal, second gate call, hold latch or sleep.
+        const heldGateStart = gate.length;
+        yield* Deferred.succeed(preparationReady, undefined);
+        const matchingRefusal = () => gate.slice(heldGateStart).find((o) =>
+          o.phase === "failure" && o.effectId === exact.effect_id &&
+          o.attemptCount === exact.attempt_count && o.threadId === threadId &&
+          o.causeTag === "GoalDispatchHeldError" && o.causeThreadId === threadId &&
+          o.causeGoalThreadId === threadId);
+        let heldRounds = 0;
+        for (; heldRounds <= maxSchedulerRounds; heldRounds++) {
+          if (overflow || continuations !== 0 || matchingRefusal() !== undefined ||
+              (yield* Effect.sync(() => executing!.pollUnsafe())) !== undefined) break;
+          if (heldRounds < maxSchedulerRounds) yield* Effect.yieldNow;
+        }
+        const heldAtBound = {
+          continuations, refusal: matchingRefusal() ?? null,
+          workerExit: (yield* Effect.sync(() => executing!.pollUnsafe()))?._tag ?? "Pending",
+          gate: gate.slice(), overflow, schedulerRounds: Math.min(heldRounds, maxSchedulerRounds),
+        };
+        const whileHeld = yield* bounded(snapshot(), "while-held-snapshot");
+        console.error("DG04_HOLD_RELEASE_HELD", JSON.stringify({
+          before, afterHold, holdReceipt, heldAtBound, whileHeld, maxSchedulerRounds,
+          gateObservationLimit: "Only actual returned errors from the forwarded service; waiting alone is not refusal.",
+        }));
+        // Clear the actual durable hold, even when the preceding observation is negative.
+        // A negative/missing witness is retained; release cannot retroactively qualify it.
+        const releaseCommand = {
+          type: "goal.resume" as const, commandId: CommandId.make("hold-release-clear"), threadId,
+        };
+        const released = yield* bounded(orchestrator.dispatch(releaseCommand), "hold-release-commit");
+        const releaseReceipt = yield* bounded(readCommand(releaseCommand.commandId), "release-receipt");
+        assert.equal(releaseReceipt.length, 1);
+        assert.equal(releaseReceipt[0]!.command_type, "goal.resume");
+        assert.equal(releaseReceipt[0]!.status, "accepted");
+        assert.equal(releaseReceipt[0]!.result_sequence, released.sequence);
+        assert.isTrue(held.sequence < released.sequence);
+        const completed = yield* pollFrozen(executing!);
+        const afterRelease = yield* bounded(snapshot(), "released-snapshot");
+        console.error("DG04_HOLD_RELEASE_RELEASED", JSON.stringify({
+          releaseReceipt, afterRelease, workerExit: completed.exit?._tag ?? "Pending",
+          schedulerRounds: completed.rounds, gate, overflow, maxSchedulerRounds,
+        }));
+        if (completed.exit === undefined) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "hold-release-worker", schedulerRounds: completed.rounds,
+        }));
+        assert.isTrue(Exit.isSuccess(completed.exit));
+        // Replaying the original accepted command and release must reuse receipts.
+        const replayStart = yield* bounded(orchestrator.dispatch(startCommand), "start-replay");
+        const replayRelease = yield* bounded(orchestrator.dispatch(releaseCommand), "release-replay");
+        yield* bounded(worker.drain(), "replay-worker");
+        const afterReplay = yield* bounded(snapshot(), "replay-snapshot");
+        console.error("DG04_HOLD_RELEASE_REPLAY", JSON.stringify({
+          replayStartSequence: replayStart.sequence, replayReleaseSequence: replayRelease.sequence,
+          originalStartSequence: started.sequence, releaseSequence: released.sequence,
+          afterReplay, gate, overflow,
+        }));
+        if (overflow || heldAtBound.overflow) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "gate-observation-overflow", schedulerRounds: maxSchedulerRounds,
+        }));
+        // Actual continuation under hold disproves the contract, even without a refusal witness.
+        assert.equal(heldAtBound.continuations, 0, "Preparation continued before actual hold release");
+        assert.equal(whileHeld.continuations, 0, "Snapshot progress cannot bypass the held gate");
+        if (heldAtBound.refusal === null) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "held-gate-refusal-unobserved", schedulerRounds: heldAtBound.schedulerRounds,
+        }));
+        assert.deepEqual(afterHold.outbox, before.outbox);
+        assert.deepEqual(whileHeld.outbox, before.outbox, "The same running effect and lease must remain");
+        for (const state of [afterHold, whileHeld, afterRelease, afterReplay]) {
+          assert.equal(state.clock, 0);
+          assert.isFalse(state.interrupted);
+          assert.equal(state.providerInterruptCalls, before.providerInterruptCalls);
+          assert.deepEqual(state.controls, before.controls, "No Stop, interrupt or budget command may intervene");
+          assert.deepEqual(state.admission, before.admission, "No second admission or budget reservation");
+          for (const policy of state.policies.filter((p) => p.sequence >= initialPolicy.sequence)) {
+            assert.deepEqual(budget(policy), budget(initialPolicy));
+          }
+          assert.deepEqual(state.runIdentity, before.runIdentity);
+          assert.deepEqual(state.sessionIdentity, before.sessionIdentity);
+          assert.equal(state.adapterEntries, before.adapterEntries);
+        }
+        for (const state of [afterRelease, afterReplay]) {
+          assert.isNull(state.policies.at(-1)!.hold);
+          assert.equal(state.continuations, 1);
+          assert.equal(state.outbox.length, 1);
+          assert.deepEqual(state.outbox.map(({ status, lease_owner, ...identity }) => identity),
+            before.outbox.map(({ status, lease_owner, ...identity }) => identity));
+          assert.equal(state.outbox[0]!.status, "succeeded");
+        }
+        assert.equal(replayStart.sequence, started.sequence);
+        assert.equal(replayRelease.sequence, released.sequence);
+        assert.deepEqual(afterReplay.policies, afterRelease.policies);
+      }).pipe(Effect.ensuring(
+        Effect.gen(function* () {
+          const cleanup = yield* Effect.gen(function* () {
+            yield* Deferred.succeed(preparationReady, undefined);
+            if (executing !== undefined) yield* Fiber.interrupt(executing);
+          }).pipe(Effect.forkScoped);
+          const completed = yield* pollFrozen(cleanup);
+          console.error("DG04_HOLD_RELEASE_CLEANUP", JSON.stringify({
+            completed: completed.exit !== undefined && Exit.isSuccess(completed.exit),
+            exit: completed.exit?._tag ?? "Pending", continuationsAfterCleanup: continuations,
+          }));
+          if (completed.exit === undefined || Exit.isFailure(completed.exit)) return yield* Effect.die(
+            new StopProgressInconclusive({ stage: "hold-release-cleanup", schedulerRounds: maxSchedulerRounds }));
+        }).pipe(Effect.orDie),
+      )),
+      {
+        captureBaseline: Effect.void,
+        checkpointRepositoryCheck: () => Effect.succeed(false),
+        observeProviderDispatch: observeGate,
+        beforeProviderCall: () => Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(preparationReady).pipe(Effect.onInterrupt(() =>
+            Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid)));
+          continuations += 1;
+        }),
+      },
+    );
+  }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+    const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+    console.error("DG04_HOLD_RELEASE_VERDICT", JSON.stringify({
+      status: Exit.isSuccess(exit) ? "PASS_SAME_ATTEMPT_HOLD_RELEASE"
+        : error instanceof StopProgressInconclusive ? "INCONCLUSIVE_NOT_QUALIFIED" : "FAIL",
+      stage: error instanceof StopProgressInconclusive ? error.stage : null,
+      cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : null,
+    }));
+  }))),
+);
 
 it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as const)(
   "F3 pending provider $0 permits Stop before release",
