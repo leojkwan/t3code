@@ -41,6 +41,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
+import * as Option from "effect/Option";
 import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -732,6 +734,47 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       let executingFiber: Fiber.Fiber<unknown, unknown> | undefined;
       // A fixed work bound, not a latency target. Never advance time to judge progress.
       const maxSchedulerRounds = 256;
+      const setupSpans: Array<{
+        name: string;
+        spanId: string;
+        parentSpanId: string | null;
+        startOrder: number;
+        startTime: string;
+        endOrder: number | null;
+        endTime: string | null;
+        exit: "Success" | "Failure" | null;
+      }> = [];
+      let setupSpanSequence = 0;
+      let setupSpanOverflow = false;
+      const setupTracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          if (setupSpans.length === maxSchedulerRounds) {
+            setupSpanOverflow = true;
+            return span;
+          }
+          const observation: (typeof setupSpans)[number] = {
+            name: span.name,
+            spanId: span.spanId,
+            parentSpanId: Option.getOrUndefined(span.parent)?.spanId ?? null,
+            startOrder: ++setupSpanSequence,
+            startTime: options.startTime.toString(),
+            endOrder: null,
+            endTime: null,
+            exit: null,
+          };
+          setupSpans.push(observation);
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            if (observation.endOrder !== null) return;
+            observation.endOrder = ++setupSpanSequence;
+            observation.endTime = endTime.toString();
+            observation.exit = exit._tag;
+          };
+          return span;
+        },
+      });
       let inspectSetupExhaustion:
         | ((workerFiber: Fiber.Fiber<unknown, unknown>) => Effect.Effect<void>)
         | undefined;
@@ -775,6 +818,28 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                 const workerAtBound = yield* Effect.sync(() => workerFiber.pollUnsafe());
                 const runningAtBound = yield* Effect.sync(() => runningFiber.pollUnsafe());
                 const startsAtBound = stub.started.length;
+                // Copy before the snapshot reads can let the worker progress.
+                // Retain only span identity/lifecycle, never attributes or causes.
+                const spansAtBound = setupSpans.map((span) => ({ ...span }));
+                const activeSpans = spansAtBound.filter((span) => span.endOrder === null);
+                const completedSpans = spansAtBound
+                  .filter((span) => span.endOrder !== null)
+                  .sort((left, right) => left.endOrder! - right.endOrder!);
+                const spanObservation = {
+                  status: setupSpanOverflow || activeSpans.length === 0
+                    ? "UNAVAILABLE_NOT_QUALIFIED"
+                    : "OBSERVED",
+                  reason: setupSpanOverflow
+                    ? "span-cap-exhausted"
+                    : activeSpans.length === 0
+                      ? "no-active-span"
+                      : null,
+                  cap: maxSchedulerRounds,
+                  overflow: setupSpanOverflow,
+                  sequence: setupSpanSequence,
+                  activeSpans,
+                  completedSpans,
+                };
                 const snapshot = yield* Effect.exit(runWithinBound(
                   Effect.gen(function* () {
                     const outbox = yield* sql<{
@@ -821,6 +886,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                   threadId: observedThreadId,
                   schedulerRounds: maxSchedulerRounds,
                   snapshotSchedulerBound: maxSchedulerRounds,
+                  spanObservation,
                   snapshotStatus: Exit.isSuccess(snapshot) ? "OBSERVED" : "UNAVAILABLE_NOT_QUALIFIED",
                   snapshotCause: Exit.isFailure(snapshot) ? Cause.pretty(snapshot.cause) : null,
                   clockAtBound,
@@ -842,7 +908,12 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
               const running = yield* waitForRunning(orchestrator);
               yield* orchestrator.dispatch(messageCommand(threadId, `${scenario}-first`));
               inspectSetupExhaustion = setupInspector(threadId, running);
-              yield* runWithinBound(worker.drain(), "setup-worker");
+              yield* runWithinBound(
+                scenario === "descendant-start"
+                  ? worker.drain().pipe(Effect.withTracer(setupTracer))
+                  : worker.drain(),
+                "setup-worker",
+              );
               yield* finishWithinBound(running, "setup-running-event");
             }
             if (descendant) {
