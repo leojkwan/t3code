@@ -807,6 +807,9 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       let inspectSetupExhaustion:
         | ((workerFiber: Fiber.Fiber<unknown, unknown>) => Effect.Effect<void>)
         | undefined;
+      let inspectWorkerCancellationExhaustion:
+        | ((workerFiber: Fiber.Fiber<unknown, unknown>) => Effect.Effect<void>)
+        | undefined;
       const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) =>
         Effect.gen(function* () {
           for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
@@ -822,6 +825,9 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
           if (progress.exit === undefined) {
             if (stage === "setup-worker" && inspectSetupExhaustion !== undefined) {
               yield* inspectSetupExhaustion(fiber);
+            }
+            if (stage === "worker-cancellation" && inspectWorkerCancellationExhaustion !== undefined) {
+              yield* inspectWorkerCancellationExhaustion(fiber);
             }
             return yield* Effect.fail(
               new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }),
@@ -1045,6 +1051,64 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
             assert.equal(pending.length, 1, "The exact pending provider effect must be claimed");
             const pendingEffectId = pending[0]!.effect_id;
             const frozenTime = DateTime.toEpochMillis(yield* DateTime.now);
+            if (scenario === "steer") {
+              inspectWorkerCancellationExhaustion = (workerFiber) => Effect.gen(function* () {
+                const workerAtBound = yield* Effect.sync(() => workerFiber.pollUnsafe());
+                const clockAtBound = DateTime.toEpochMillis(yield* DateTime.now);
+                const interruptsAtBound = stub.interrupts.map((interrupt) => ({
+                  providerThreadId: interrupt.providerThread.id,
+                  providerTurnId: interrupt.providerTurnId,
+                }));
+                const snapshot = yield* Effect.exit(runWithinBound(
+                  Effect.gen(function* () {
+                    const outbox = yield* sql<{
+                      effect_id: string;
+                      effect_type: string;
+                      status: string;
+                      attempt_count: number;
+                      lease_owner: string | null;
+                    }>`
+                      SELECT effect_id, effect_type, status, attempt_count, lease_owner
+                      FROM orchestration_v2_effect_outbox WHERE thread_id = ${target}
+                      ORDER BY effect_id LIMIT ${maxSchedulerRounds + 1}
+                    `;
+                    const projection = yield* orchestrator.getThreadProjection(target);
+                    const providerTurns = projection.providerTurns.map((turn) => ({
+                      id: turn.id,
+                      providerThreadId: turn.providerThreadId,
+                      runAttemptId: turn.runAttemptId,
+                      status: turn.status,
+                    }));
+                    const attempts = projection.attempts.map((attempt) => ({
+                      id: attempt.id,
+                      providerTurnId: attempt.providerTurnId,
+                      status: attempt.status,
+                    }));
+                    const overflow = [outbox, providerTurns, attempts, interruptsAtBound]
+                      .some((rows) => rows.length > maxSchedulerRounds);
+                    return overflow
+                      ? { status: "UNAVAILABLE_NOT_QUALIFIED" as const, overflow: true }
+                      : { status: "OBSERVED" as const, overflow: false, outbox, providerTurns, attempts };
+                  }),
+                  "worker-cancellation-observation",
+                ));
+                console.error("DG04_WORKER_CANCELLATION_SNAPSHOT", JSON.stringify({
+                  scenario,
+                  pendingEffectId,
+                  maxSchedulerRounds,
+                  exhaustedSchedulerRounds: maxSchedulerRounds,
+                  workerExitAtBound: workerAtBound?._tag ?? "Pending",
+                  workerExitAfterSnapshot: (yield* Effect.sync(() => workerFiber.pollUnsafe()))?._tag ?? "Pending",
+                  clockAtBound,
+                  clockAfterSnapshot: DateTime.toEpochMillis(yield* DateTime.now),
+                  frozenTime,
+                  interruptsAtBound: interruptsAtBound.length <= maxSchedulerRounds ? interruptsAtBound : null,
+                  interruptOverflow: interruptsAtBound.length > maxSchedulerRounds,
+                  snapshot: Exit.isSuccess(snapshot) ? snapshot.value : { status: "UNAVAILABLE_NOT_QUALIFIED" },
+                  snapshotExit: snapshot._tag,
+                }));
+              });
+            }
             const starts = stub.started.length;
             const steers = stub.steered.length;
             const stopCommand = {
