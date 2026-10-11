@@ -1,8 +1,9 @@
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { ProviderDriverKind, ProviderReplayTranscript } from "@t3tools/contracts";
+import type { OrchestrationV2StoredEvent, ProviderDriverKind, ProviderReplayTranscript, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -257,6 +258,17 @@ export interface ProviderDispatchObservation {
   readonly causeGoalThreadId?: string | null;
 }
 
+// Default-absent ordering seam for one owned policy-stream consumer only.
+export type PolicyStreamInput = NonNullable<Parameters<Orchestrator.OrchestratorV2Shape["streamStoredEventsFrom"]>[0]>;
+export type PolicyStreamEntryObservation =
+  | { readonly phase: "realSubscriptionEntered" | "realSubscriptionFinalized"; readonly input: PolicyStreamInput }
+  | { readonly phase: "storedEventDelivered"; readonly input: PolicyStreamInput; readonly storedEvent: OrchestrationV2StoredEvent };
+export interface PolicyStreamEntrySeam {
+  readonly threadId: ThreadId;
+  readonly beforeSubscribe: (input: PolicyStreamInput) => Effect.Effect<void>;
+  readonly observe: (observation: PolicyStreamEntryObservation) => void;
+}
+
 export interface InterruptPhaseObservation {
   readonly phase: "interrupt-enter" | "interrupt-exit" | "control-read-enter" | "control-read-exit";
   readonly exit?: "Success" | "Failure";
@@ -277,6 +289,7 @@ export function layerWithRegistry<Error>(
     readonly observeInterrupt?: (observation: InterruptPhaseObservation) => void;
     // Test-owned observation of actual calls/results only; no extra gate invocation.
     readonly observeProviderDispatch?: (observation: ProviderDispatchObservation) => void;
+    readonly policyStreamEntry?: PolicyStreamEntrySeam;
     // Optional setup fixture only; all other checkpoint consumers remain real.
     readonly captureBaseline?: Effect.Effect<void, CheckpointService.CheckpointServiceV2Error>;
     // Optional capability fixture; checkpoint metadata and persistence stay real.
@@ -540,9 +553,28 @@ export function layerWithRegistry<Error>(
               Effect.tap(() => Effect.sync(() => observe({ ...input, phase: "return" }))),
             );
           });
+      const entry = options.policyStreamEntry;
+      const streamStoredEventsFrom: Orchestrator.OrchestratorV2Shape["streamStoredEventsFrom"] =
+        entry === undefined ? orchestrator.streamStoredEventsFrom : (input) =>
+          input?.threadId !== entry.threadId || input.eventType !== "goal.dispatch-policy.updated"
+            ? orchestrator.streamStoredEventsFrom(input)
+            : Stream.unwrap(Effect.gen(function* () {
+                yield* entry.beforeSubscribe(input);
+                return Stream.suspend(() => {
+                  // Consumption of the real stream starts here, after the ordering action.
+                  // This is not a claim about the internal PubSub registration instruction.
+                  entry.observe({ phase: "realSubscriptionEntered", input });
+                  return orchestrator.streamStoredEventsFrom(input).pipe(
+                    Stream.tap((storedEvent) => Effect.sync(() =>
+                      entry.observe({ phase: "storedEventDelivered", input, storedEvent }))),
+                    Stream.ensuring(Effect.sync(() =>
+                      entry.observe({ phase: "realSubscriptionFinalized", input }))),
+                  );
+                });
+              }));
       return Layer.mock(ThreadManagementService.ThreadManagementService)({
         withProviderDispatch,
-        streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
+        streamStoredEventsFrom,
         dispatch: orchestrator.dispatch,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,
