@@ -87,6 +87,7 @@ interface Stub {
 const makeStub = (
   cwd: string,
   beforeProviderCall?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void>,
+  emitTerminalOnInterrupt = false,
 ) =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
@@ -167,8 +168,41 @@ const makeStub = (
                 yield* beforeProviderCall?.("steer", input.threadId) ?? Effect.void;
               }),
             interruptTurn: (interrupt) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 interrupts.push(interrupt);
+                if (!emitTerminalOnInterrupt) return;
+                const turn = started.find((candidate) =>
+                  `provider-turn:${candidate.attemptId}` === interrupt.providerTurnId,
+                );
+                if (turn === undefined) {
+                  return yield* Effect.die("The inert interrupt must target an actually started turn");
+                }
+                const stoppedAt = yield* DateTime.now;
+                yield* Queue.offer(events, {
+                  type: "provider_turn.updated",
+                  driver,
+                  providerTurn: {
+                    id: interrupt.providerTurnId,
+                    providerThreadId: interrupt.providerThread.id,
+                    nodeId: turn.rootNodeId,
+                    runAttemptId: turn.attemptId,
+                    nativeTurnRef: { driver, nativeId: `native:${turn.attemptId}`, strength: "strong" },
+                    ordinal: turn.providerTurnOrdinal,
+                    status: "interrupted",
+                    startedAt: now,
+                    completedAt: stoppedAt,
+                  },
+                });
+                yield* Queue.offer(events, {
+                  type: "turn.terminal",
+                  driver,
+                  providerThreadId: interrupt.providerThread.id,
+                  providerTurnId: interrupt.providerTurnId,
+                  runOrdinal: turn.runOrdinal,
+                  status: "interrupted",
+                  failure: null,
+                  threadDisposition: "reusable",
+                });
               }),
             respondToRuntimeRequest: () => Effect.die("unused"),
             readThreadSnapshot: () => Effect.die("unused"),
@@ -205,6 +239,7 @@ const heldQueueCheck = (obs: Observation, startsBeforeStop: number) =>
   obs.stubStarts === startsBeforeStop;
 
 interface PhaseOptions {
+  readonly emitTerminalOnInterrupt?: boolean;
   readonly captureBaseline?: Effect.Effect<void>;
   readonly inspectSetupSpawner?: boolean;
   readonly beforeProviderCall?: (
@@ -550,7 +585,7 @@ const withHarness = <A, E>(
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = options.workspacePath ?? (yield* checkpointWorkspace(name));
-      const stub = yield* makeStub(cwd, options.beforeProviderCall);
+      const stub = yield* makeStub(cwd, options.beforeProviderCall, options.emitTerminalOnInterrupt);
       let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1282,6 +1317,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
           ),
         {
           captureBaseline: Effect.void,
+          emitTerminalOnInterrupt: true,
           inspectSetupSpawner: scenario === "descendant-start",
           beforeProviderCall: (callType, target) =>
             target !== blockedThread || callType !== type
