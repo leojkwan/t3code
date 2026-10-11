@@ -253,6 +253,8 @@ export function layerWithRegistry<Error>(
       MigrationError | PlatformError.PlatformError | SqlError
     >;
     readonly runEffectWorker?: boolean;
+    // Optional setup fixture only; all other checkpoint consumers remain real.
+    readonly captureBaseline?: Effect.Effect<void, CheckpointService.CheckpointServiceV2Error>;
     // Start continuation runs for provider wake turns, as the live runtime does.
     // Off by default: most fixtures record no wake turn.
     readonly runContinuationWorker?: boolean;
@@ -353,7 +355,16 @@ export function layerWithRegistry<Error>(
   const layerProviderSwitchServiceProvided = ProviderSwitchService.layer.pipe(
     Layer.provide(layerProvidedRegistry),
   );
-  const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
+  const captureBaseline = options.captureBaseline;
+  const layerRunExecution = captureBaseline === undefined
+    ? RunExecutionService.layer
+    : RunExecutionService.layer.pipe(
+        Layer.updateService(CheckpointService.CheckpointServiceV2, (service) => ({
+          ...service,
+          captureBaseline: () => captureBaseline,
+        })),
+      );
+  const layerRunExecutionServiceProvided = layerRunExecution.pipe(
     Layer.provide(
       Layer.mergeAll(
         McpAppModelContext.layerEmpty,

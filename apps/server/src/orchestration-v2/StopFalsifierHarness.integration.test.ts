@@ -205,6 +205,7 @@ const heldQueueCheck = (obs: Observation, startsBeforeStop: number) =>
   obs.stubStarts === startsBeforeStop;
 
 interface PhaseOptions {
+  readonly captureBaseline?: Effect.Effect<void>;
   readonly inspectSetupSpawner?: boolean;
   readonly beforeProviderCall?: (
     type: "start" | "steer",
@@ -635,6 +636,7 @@ const withHarness = <A, E>(
                 runEffectWorker: false,
                 databaseLayer,
                 recoverOnStartup: options.recoverOnStartup ?? false,
+                ...(options.captureBaseline === undefined ? {} : { captureBaseline: options.captureBaseline }),
               },
             );
             const management = ThreadManagementService.layer.pipe(Layer.provide(runtime));
@@ -1215,6 +1217,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
             })),
           ),
         {
+          captureBaseline: Effect.void,
           inspectSetupSpawner: scenario === "descendant-start",
           beforeProviderCall: (callType, target) =>
             target !== blockedThread || callType !== type
