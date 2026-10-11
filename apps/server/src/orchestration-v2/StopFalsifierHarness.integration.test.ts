@@ -57,6 +57,7 @@ import type {
 } from "./ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import type * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import { checkpointWorkspace } from "./testkit/ReplayFixtureWorkspace.ts";
 
 // Stop falsifier harness (shadow row ~dg03). Nonbillable: the provider is a stub
@@ -251,6 +252,7 @@ interface PhaseOptions {
   readonly emitTerminalOnInterrupt?: boolean;
   readonly acknowledgeInterruptIngestion?: boolean;
   readonly captureBaseline?: Effect.Effect<void>;
+  readonly checkpointRepositoryCheck?: CheckpointStore.CheckpointStore["Service"]["isGitRepository"];
   readonly inspectSetupSpawner?: boolean;
   readonly observeInterrupt?: (observation: ProviderReplayHarness.InterruptPhaseObservation) => void;
   readonly beforeProviderCall?: (
@@ -722,6 +724,7 @@ const withHarness = <A, E>(
                 databaseLayer,
                 recoverOnStartup: options.recoverOnStartup ?? false,
                 ...(options.captureBaseline === undefined ? {} : { captureBaseline: options.captureBaseline }),
+                ...(options.checkpointRepositoryCheck === undefined ? {} : { checkpointRepositoryCheck: options.checkpointRepositoryCheck }),
                 ...(options.observeInterrupt === undefined ? {} : { observeInterrupt: options.observeInterrupt }),
               },
             );
@@ -1399,6 +1402,8 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
           ),
         {
           captureBaseline: Effect.void,
+          // Exercise the real missing-checkpoint metadata path without filesystem storage.
+          checkpointRepositoryCheck: () => Effect.succeed(false),
           emitTerminalOnInterrupt: true,
           acknowledgeInterruptIngestion: true,
           ...(scenario === "steer" ? { observeInterrupt: recordInterruptPhase } : {}),

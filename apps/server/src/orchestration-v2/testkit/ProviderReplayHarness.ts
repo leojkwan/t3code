@@ -264,6 +264,8 @@ export function layerWithRegistry<Error>(
     readonly observeInterrupt?: (observation: InterruptPhaseObservation) => void;
     // Optional setup fixture only; all other checkpoint consumers remain real.
     readonly captureBaseline?: Effect.Effect<void, CheckpointService.CheckpointServiceV2Error>;
+    // Optional capability fixture; checkpoint metadata and persistence stay real.
+    readonly checkpointRepositoryCheck?: CheckpointStore.CheckpointStore["Service"]["isGitRepository"];
     // Start continuation runs for provider wake turns, as the live runtime does.
     // Off by default: most fixtures record no wake turn.
     readonly runContinuationWorker?: boolean;
@@ -334,7 +336,16 @@ export function layerWithRegistry<Error>(
     Layer.provide(layerVcsDriverRegistry),
     Layer.provide(NodeServices.layer),
   );
-  const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
+  const checkpointRepositoryCheck = options.checkpointRepositoryCheck;
+  const layerCheckpointService = checkpointRepositoryCheck === undefined
+    ? CheckpointService.layer
+    : CheckpointService.layer.pipe(
+        Layer.updateService(CheckpointStore.CheckpointStore, (store) => ({
+          ...store,
+          isGitRepository: checkpointRepositoryCheck,
+        })),
+      );
+  const layerCheckpointServiceProvided = layerCheckpointService.pipe(
     Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer)),
   );
   const layerContextHandoffServiceProvided = ContextHandoffService.layer.pipe(
