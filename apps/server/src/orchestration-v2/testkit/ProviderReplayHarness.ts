@@ -244,6 +244,13 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
   return layerWithRegistry(scenario, layerRegistry, options);
 }
 
+export interface InterruptPhaseObservation {
+  readonly phase: "interrupt-enter" | "interrupt-exit" | "control-read-enter" | "control-read-exit";
+  readonly exit?: "Success" | "Failure";
+  readonly providerTurnStatus?: string | null;
+  readonly attemptStatus?: string | null;
+}
+
 export function layerWithRegistry<Error>(
   scenario: Pick<OrchestratorV2ProviderReplayScenario, "name" | "runtimePolicyOverride">,
   registryLayer: Layer.Layer<ProviderAdapterRegistry.ProviderAdapterRegistryV2, Error>,
@@ -253,6 +260,8 @@ export function layerWithRegistry<Error>(
       MigrationError | PlatformError.PlatformError | SqlError
     >;
     readonly runEffectWorker?: boolean;
+    // Optional synchronous observation only; original services and results are forwarded.
+    readonly observeInterrupt?: (observation: InterruptPhaseObservation) => void;
     // Optional setup fixture only; all other checkpoint consumers remain real.
     readonly captureBaseline?: Effect.Effect<void, CheckpointService.CheckpointServiceV2Error>;
     // Start continuation runs for provider wake turns, as the live runtime does.
@@ -392,7 +401,35 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
-  const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
+  const observeInterrupt = options.observeInterrupt;
+  let observedInterrupt: Parameters<
+    ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"]
+  >[0] | undefined;
+  const layerProviderTurnControl = observeInterrupt === undefined
+    ? ProviderTurnControlService.layer
+    : ProviderTurnControlService.layer.pipe(
+        Layer.updateService(ProjectionStore.ProjectionStoreV2, (service) => ({
+          ...service,
+          getProviderControlContext: (threadId, target) => Effect.suspend(() => {
+            if (observedInterrupt?.threadId !== threadId ||
+              observedInterrupt.providerTurnId !== target.providerTurnId) {
+              return service.getProviderControlContext(threadId, target);
+            }
+            observeInterrupt({ phase: "control-read-enter" });
+            return service.getProviderControlContext(threadId, target).pipe(
+              Effect.onExit((exit) => Effect.sync(() => observeInterrupt({
+                phase: "control-read-exit",
+                exit: exit._tag,
+                ...(exit._tag === "Success" ? {
+                  providerTurnStatus: exit.value.providerTurn?.status ?? null,
+                  attemptStatus: exit.value.attempt?.status ?? null,
+                } : {}),
+              }))),
+            );
+          }),
+        })),
+      );
+  const layerProviderTurnControlServiceProvided = layerProviderTurnControl.pipe(
     Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
   );
   const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
@@ -472,7 +509,24 @@ export function layerWithRegistry<Error>(
           ),
         )
       : Layer.empty;
-  const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
+  const layerEffectExecutor = observeInterrupt === undefined
+    ? EffectWorker.layerExecutor
+    : EffectWorker.layerExecutor.pipe(
+        Layer.updateService(ProviderTurnControlService.ProviderTurnControlServiceV2, (service) => ({
+          ...service,
+          interrupt: (input) => Effect.suspend(() => {
+            observedInterrupt = input;
+            observeInterrupt({ phase: "interrupt-enter" });
+            return service.interrupt(input).pipe(
+              Effect.onExit((exit) => Effect.sync(() => {
+                observeInterrupt({ phase: "interrupt-exit", exit: exit._tag });
+                observedInterrupt = undefined;
+              })),
+            );
+          }),
+        })),
+      );
+  const layerEffectExecutorProvided = layerEffectExecutor.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerRunFinalizationServiceProvided,

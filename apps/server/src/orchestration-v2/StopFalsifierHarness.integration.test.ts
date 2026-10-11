@@ -242,6 +242,7 @@ interface PhaseOptions {
   readonly emitTerminalOnInterrupt?: boolean;
   readonly captureBaseline?: Effect.Effect<void>;
   readonly inspectSetupSpawner?: boolean;
+  readonly observeInterrupt?: (observation: ProviderReplayHarness.InterruptPhaseObservation) => void;
   readonly beforeProviderCall?: (
     type: "start" | "steer",
     threadId: ThreadId,
@@ -672,6 +673,7 @@ const withHarness = <A, E>(
                 databaseLayer,
                 recoverOnStartup: options.recoverOnStartup ?? false,
                 ...(options.captureBaseline === undefined ? {} : { captureBaseline: options.captureBaseline }),
+                ...(options.observeInterrupt === undefined ? {} : { observeInterrupt: options.observeInterrupt }),
               },
             );
             const management = ThreadManagementService.layer.pipe(Layer.provide(runtime));
@@ -781,6 +783,15 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
       let executingFiber: Fiber.Fiber<unknown, unknown> | undefined;
       // A fixed work bound, not a latency target. Never advance time to judge progress.
       const maxSchedulerRounds = 256;
+      const interruptPhases: Array<ProviderReplayHarness.InterruptPhaseObservation & { order: number }> = [];
+      let interruptPhaseOverflow = false;
+      const recordInterruptPhase = (observation: ProviderReplayHarness.InterruptPhaseObservation) => {
+        if (interruptPhases.length === maxSchedulerRounds) {
+          interruptPhaseOverflow = true;
+          return;
+        }
+        interruptPhases.push({ order: interruptPhases.length + 1, ...observation });
+      };
       const setupSpans: Array<{
         name: string;
         spanId: string;
@@ -1088,6 +1099,8 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
             const frozenTime = DateTime.toEpochMillis(yield* DateTime.now);
             if (scenario === "steer") {
               inspectWorkerCancellationExhaustion = (workerFiber) => Effect.gen(function* () {
+                const interruptPhasesAtBound = interruptPhases.slice();
+                const interruptOverflowAtBound = interruptPhaseOverflow;
                 const workerAtBound = yield* Effect.sync(() => workerFiber.pollUnsafe());
                 const clockAtBound = DateTime.toEpochMillis(yield* DateTime.now);
                 const interruptsAtBound = stub.interrupts.map((interrupt) => ({
@@ -1119,11 +1132,23 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                       providerTurnId: attempt.providerTurnId,
                       status: attempt.status,
                     }));
-                    const overflow = [outbox, providerTurns, attempts, interruptsAtBound]
+                    const interruptSettlementReceipts = yield* sql<{
+                      command_id: string;
+                      status: string;
+                      result_sequence: number;
+                    }>`
+                      SELECT command_id, status, result_sequence FROM orchestration_command_receipts
+                      WHERE command_id IN (
+                        SELECT effect_id || ':background-work-settled'
+                        FROM orchestration_v2_effect_outbox
+                        WHERE thread_id = ${target} AND effect_type = 'provider-turn.interrupt'
+                      ) LIMIT ${maxSchedulerRounds + 1}
+                    `;
+                    const overflow = [outbox, providerTurns, attempts, interruptsAtBound, interruptSettlementReceipts]
                       .some((rows) => rows.length > maxSchedulerRounds);
                     return overflow
                       ? { status: "UNAVAILABLE_NOT_QUALIFIED" as const, overflow: true }
-                      : { status: "OBSERVED" as const, overflow: false, outbox, providerTurns, attempts };
+                      : { status: "OBSERVED" as const, overflow: false, outbox, providerTurns, attempts, interruptSettlementReceipts };
                   }),
                   "worker-cancellation-observation",
                 ));
@@ -1139,6 +1164,14 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                   frozenTime,
                   interruptsAtBound: interruptsAtBound.length <= maxSchedulerRounds ? interruptsAtBound : null,
                   interruptOverflow: interruptsAtBound.length > maxSchedulerRounds,
+                  interruptObservation: {
+                    status: interruptOverflowAtBound || interruptPhaseOverflow || interruptPhasesAtBound.length === 0
+                      ? "UNAVAILABLE_NOT_QUALIFIED" : "OBSERVED",
+                    overflowAtBound: interruptOverflowAtBound,
+                    overflowAfterSnapshot: interruptPhaseOverflow,
+                    atBound: interruptPhasesAtBound,
+                    afterSnapshot: interruptPhases.slice(),
+                  },
                   snapshot: Exit.isSuccess(snapshot) ? snapshot.value : { status: "UNAVAILABLE_NOT_QUALIFIED" },
                   snapshotExit: snapshot._tag,
                 }));
@@ -1318,6 +1351,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
         {
           captureBaseline: Effect.void,
           emitTerminalOnInterrupt: true,
+          ...(scenario === "steer" ? { observeInterrupt: recordInterruptPhase } : {}),
           inspectSetupSpawner: scenario === "descendant-start",
           beforeProviderCall: (callType, target) =>
             target !== blockedThread || callType !== type
