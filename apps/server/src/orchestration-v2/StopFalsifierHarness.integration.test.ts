@@ -43,6 +43,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import * as Option from "effect/Option";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -204,6 +205,7 @@ const heldQueueCheck = (obs: Observation, startsBeforeStop: number) =>
   obs.stubStarts === startsBeforeStop;
 
 interface PhaseOptions {
+  readonly inspectSetupSpawner?: boolean;
   readonly beforeProviderCall?: (
     type: "start" | "steer",
     threadId: ThreadId,
@@ -534,6 +536,7 @@ const withHarness = <A, E>(
     readonly pollScheduled: Effect.Effect<void>;
 
     readonly stub: Stub;
+    readonly setupSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"] | undefined;
     readonly threadId: ThreadId;
     readonly observe: (caseName: string) => Effect.Effect<Observation>;
     readonly send: (
@@ -598,7 +601,11 @@ const withHarness = <A, E>(
         const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
         const management = yield* ThreadManagementService.ThreadManagementService;
         const scheduled = yield* ScheduledTaskService.ScheduledTaskService;
+        const setupSpawner = options.inspectSetupSpawner === true
+          ? yield* ChildProcessSpawner.ChildProcessSpawner
+          : undefined;
         return yield* body({
+          setupSpawner,
           orchestrator,
           worker,
           sink,
@@ -660,8 +667,11 @@ const withHarness = <A, E>(
                 ),
               ),
             );
+            const exposedRuntime = options.inspectSetupSpawner === true
+              ? runtime.pipe(Layer.provideMerge(NodeServices.layer))
+              : runtime;
             return Layer.mergeAll(
-              runtime,
+              exposedRuntime,
               databaseLayer,
               ThreadCommandExecutor.layer,
               management,
@@ -775,6 +785,23 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
           return span;
         },
       });
+      const setupProcessPhases: Array<{
+        order: number;
+        callId: number;
+        phase: "spawn-entry" | "spawn-return" | "spawn-failure" | "exit-wait" | "exit-result";
+        pid: number | null;
+        exit: "Success" | "Failure" | null;
+        code: number | null;
+      }> = [];
+      let setupProcessOverflow = false;
+      let setupProcessCallId = 0;
+      const recordProcessPhase = (phase: Omit<(typeof setupProcessPhases)[number], "order">) => {
+        if (setupProcessPhases.length === maxSchedulerRounds) {
+          setupProcessOverflow = true;
+          return;
+        }
+        setupProcessPhases.push({ order: setupProcessPhases.length + 1, ...phase });
+      };
       let inspectSetupExhaustion:
         | ((workerFiber: Fiber.Fiber<unknown, unknown>) => Effect.Effect<void>)
         | undefined;
@@ -807,7 +834,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
         });
       return yield* withHarness(
         `pending-${scenario}`,
-        ({ orchestrator, worker, stub, threadId, sql, executor }) =>
+        ({ orchestrator, worker, stub, threadId, sql, executor, setupSpawner }) =>
           Effect.gen(function* () {
             const setupInspector = (
               observedThreadId: ThreadId,
@@ -820,6 +847,23 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                 const startsAtBound = stub.started.length;
                 // Copy before the snapshot reads can let the worker progress.
                 // Retain only span identity/lifecycle, never attributes or causes.
+                const processPhasesAtBound = setupProcessPhases.map((phase) => ({ ...phase }));
+                const processObservation = {
+                  status: setupProcessOverflow || processPhasesAtBound.length === 0
+                    ? "UNAVAILABLE_NOT_QUALIFIED"
+                    : "OBSERVED",
+                  overflow: setupProcessOverflow,
+                  cap: maxSchedulerRounds,
+                  phases: processPhasesAtBound,
+                };
+                const schedulerObservation = yield* Effect.withFiber((pollingFiber) => Effect.succeed({
+                  pollingExecutionMode: pollingFiber.cache.scheduler.executionMode,
+                  workerExecutionMode: workerFiber.cache.scheduler.executionMode,
+                  pollingSchedulerClass: pollingFiber.cache.scheduler.constructor.name,
+                  workerSchedulerClass: workerFiber.cache.scheduler.constructor.name,
+                  nodeSetImmediateAvailable: typeof globalThis.setImmediate === "function",
+                  processCallbackOpportunity: "SOURCE_ONLY_NOT_CALLBACK_OBSERVATION",
+                }));
                 const spansAtBound = setupSpans.map((span) => ({ ...span }));
                 const activeSpans = spansAtBound.filter((span) => span.endOrder === null);
                 const completedSpans = spansAtBound
@@ -887,6 +931,8 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
                   schedulerRounds: maxSchedulerRounds,
                   snapshotSchedulerBound: maxSchedulerRounds,
                   spanObservation,
+                  processObservation,
+                  schedulerObservation,
                   snapshotStatus: Exit.isSuccess(snapshot) ? "OBSERVED" : "UNAVAILABLE_NOT_QUALIFIED",
                   snapshotCause: Exit.isFailure(snapshot) ? Cause.pretty(snapshot.cause) : null,
                   clockAtBound,
@@ -908,12 +954,45 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
               const running = yield* waitForRunning(orchestrator);
               yield* orchestrator.dispatch(messageCommand(threadId, `${scenario}-first`));
               inspectSetupExhaustion = setupInspector(threadId, running);
-              yield* runWithinBound(
-                scenario === "descendant-start"
-                  ? worker.drain().pipe(Effect.withTracer(setupTracer))
-                  : worker.drain(),
-                "setup-worker",
-              );
+              if (scenario === "descendant-start" && setupSpawner !== undefined) {
+                // Observe the real memoized fixture service only during setup.
+                // Forward every command, stream and scope; restore on every exit.
+                yield* Effect.acquireUseRelease(
+                  Effect.sync(() => {
+                    const originalSpawn = setupSpawner.spawn;
+                    setupSpawner.spawn = (command) => Effect.suspend(() => {
+                      const callId = ++setupProcessCallId;
+                      recordProcessPhase({ callId, phase: "spawn-entry", pid: null, exit: null, code: null });
+                      return originalSpawn.call(setupSpawner, command).pipe(
+                        Effect.tapError(() => Effect.sync(() => {
+                          recordProcessPhase({ callId, phase: "spawn-failure", pid: null, exit: "Failure", code: null });
+                        })),
+                        Effect.map((child) => {
+                          const pid = Number(child.pid);
+                          recordProcessPhase({ callId, phase: "spawn-return", pid, exit: "Success", code: null });
+                          return ChildProcessSpawner.makeHandle({
+                            ...child,
+                            exitCode: Effect.suspend(() => {
+                              recordProcessPhase({ callId, phase: "exit-wait", pid, exit: null, code: null });
+                              return child.exitCode.pipe(Effect.onExit((exit) => Effect.sync(() => {
+                                recordProcessPhase({
+                                  callId, phase: "exit-result", pid, exit: exit._tag,
+                                  code: Exit.isSuccess(exit) ? Number(exit.value) : null,
+                                });
+                              })));
+                            }),
+                          });
+                        }),
+                      );
+                    });
+                    return originalSpawn;
+                  }),
+                  () => runWithinBound(worker.drain().pipe(Effect.withTracer(setupTracer)), "setup-worker"),
+                  (originalSpawn) => Effect.sync(() => { setupSpawner.spawn = originalSpawn; }),
+                );
+              } else {
+                yield* runWithinBound(worker.drain(), "setup-worker");
+              }
               yield* finishWithinBound(running, "setup-running-event");
             }
             if (descendant) {
@@ -1136,6 +1215,7 @@ it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as con
             })),
           ),
         {
+          inspectSetupSpawner: scenario === "descendant-start",
           beforeProviderCall: (callType, target) =>
             target !== blockedThread || callType !== type
               ? Effect.void
