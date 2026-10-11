@@ -96,6 +96,7 @@ const makeStub = (
     emitTerminal: Effect.Effect<void>,
   ) => Effect.Effect<void>,
   afterProviderPreparation?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void>,
+  onStartContinuationInterrupted?: (threadId: ThreadId) => Effect.Effect<void>,
 ) =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
@@ -150,7 +151,7 @@ const makeStub = (
               Effect.gen(function* () {
                 started.push(turn);
                 yield* beforeProviderCall?.("start", turn.threadId) ?? Effect.void;
-                yield* GoalHold.guardProviderContinuation(turn.threadId, Effect.gen(function* () {
+                const continuation = GoalHold.guardProviderContinuation(turn.threadId, Effect.gen(function* () {
                   yield* afterProviderPreparation?.("start", turn.threadId) ?? Effect.void;
                   yield* Queue.offer(events, {
                     type: "provider_turn.updated",
@@ -171,7 +172,10 @@ const makeStub = (
                       completedAt: null,
                     },
                   });
-                })).pipe(Effect.mapError((cause) => new ProviderAdapterTurnStartError({
+                }));
+                yield* (onStartContinuationInterrupted === undefined ? continuation : continuation.pipe(
+                  Effect.onInterrupt(() => onStartContinuationInterrupted(turn.threadId)),
+                )).pipe(Effect.mapError((cause) => new ProviderAdapterTurnStartError({
                   driver, threadId: turn.threadId, providerThreadId: turn.providerThread.id,
                   runId: turn.runId, cause,
                 })));
@@ -278,6 +282,7 @@ interface PhaseOptions {
   readonly afterProviderPreparation?: (
     type: "start" | "steer", threadId: ThreadId,
   ) => Effect.Effect<void>;
+  readonly onStartContinuationInterrupted?: (threadId: ThreadId) => Effect.Effect<void>;
   readonly workspacePath?: string;
   // A second runtime over the same stored data: skip thread creation, own layer name.
   readonly existingThread?: boolean;
@@ -656,6 +661,7 @@ const withHarness = <A, E>(
             }
           })).pipe(Effect.orDie),
         options.afterProviderPreparation,
+        options.onStartContinuationInterrupted,
       );
       let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
@@ -1090,6 +1096,284 @@ it.effect("F4 preparation hold resumes the same admitted attempt exactly once af
     }));
   }))),
 );
+
+// Stop must cancel the already admitted continuation while its real hold is still active.
+it.effect("F4 Stop cancels a held post-preparation continuation before release", () =>
+  Effect.gen(function* () {
+    const maxSchedulerRounds = 256;
+    const entered = yield* Deferred.make<void>();
+    const preparationReady = yield* Deferred.make<void>();
+    let continuations = 0;
+    let continuationInterruptions = 0;
+    let ownedThread: ThreadId | undefined;
+    let executing: Fiber.Fiber<unknown, unknown> | undefined;
+    const gate: Array<ProviderReplayHarness.ProviderDispatchObservation & { order: number }> = [];
+    let overflow = false;
+    const observeGate = (observation: ProviderReplayHarness.ProviderDispatchObservation) => {
+      if (observation.threadId !== ownedThread) return;
+      if (gate.length === maxSchedulerRounds) { overflow = true; return; }
+      gate.push({ ...observation, order: gate.length + 1 });
+    };
+    const pollFrozen = <A, E>(fiber: Fiber.Fiber<A, E>) => Effect.gen(function* () {
+      for (let rounds = 0; rounds <= maxSchedulerRounds; rounds++) {
+        const exit = yield* Effect.sync(() => fiber.pollUnsafe());
+        if (exit !== undefined) return { exit, rounds };
+        if (rounds < maxSchedulerRounds) yield* Effect.yieldNow;
+      }
+      return { exit: undefined, rounds: maxSchedulerRounds };
+    });
+    const bounded = <A, E, R>(work: Effect.Effect<A, E, R>, stage: string) =>
+      Effect.gen(function* () {
+        const fiber = yield* work.pipe(Effect.forkScoped);
+        const progress = yield* pollFrozen(fiber);
+        if (progress.exit === undefined) return yield* Effect.fail(
+          new StopProgressInconclusive({ stage, schedulerRounds: progress.rounds }));
+        return yield* progress.exit;
+      });
+    yield* withHarness("held-continuation-stop", ({ orchestrator, worker, threadId, sql, stub, executor }) =>
+      Effect.gen(function* () {
+        ownedThread = threadId;
+        const readCommand = (id: string) => sql<{
+          command_id: string; aggregate_id: string; command_type: string;
+          status: string; result_sequence: number; error: string | null;
+        }>`SELECT command_id, aggregate_id, command_type, status, result_sequence, error
+           FROM orchestration_command_receipts WHERE command_id = ${id}`;
+        const snapshot = () => Effect.gen(function* () {
+          const effects = yield* sql<{
+            effect_id: string; thread_id: string; effect_type: string;
+            attempt_count: number; status: string; lease_owner: string | null;
+          }>`SELECT effect_id, thread_id, effect_type, attempt_count, status, lease_owner
+             FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+               AND effect_type IN ('provider-turn.start', 'provider-turn.steer', 'provider-turn.restart')
+             ORDER BY effect_id LIMIT 257`;
+          const policies = yield* sql<{
+            sequence: number; command_id: string | null; hold: string | null;
+            request_limit: number | null; used: number; grant_id: string | null;
+          }>`SELECT sequence, command_id, json_extract(payload_json, '$.hold') AS hold,
+               json_extract(payload_json, '$.limit') AS request_limit,
+               json_extract(payload_json, '$.used') AS used,
+               json_extract(payload_json, '$.grant') AS grant_id
+             FROM orchestration_events WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+               AND event_type = 'goal.dispatch-policy.updated' ORDER BY sequence LIMIT 257`;
+          const admissions = yield* sql<{
+            command_id: string; status: string; result_sequence: number;
+          }>`SELECT command_id, status, result_sequence FROM orchestration_command_receipts
+             WHERE aggregate_id = ${threadId} AND command_type = 'goal.provider-dispatch'
+             ORDER BY command_id LIMIT 257`;
+          const controls = yield* sql<{
+            command_id: string; command_type: string; status: string; result_sequence: number;
+          }>`SELECT command_id, command_type, status, result_sequence
+             FROM orchestration_command_receipts WHERE aggregate_id = ${threadId}
+               AND command_type IN ('thread.stop', 'run.interrupt', 'goal.budget.set')
+             ORDER BY command_id LIMIT 257`;
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          if ([effects, policies, admissions, controls, projection.runs, projection.attempts]
+              .some((rows) => rows.length > maxSchedulerRounds)) {
+            return yield* Effect.fail(new StopProgressInconclusive({
+              stage: "held-stop-snapshot-overflow", schedulerRounds: maxSchedulerRounds,
+            }));
+          }
+          return { effects, policies, admissions, controls, continuations, continuationInterruptions,
+            runs: projection.runs.map((run) => ({
+              id: run.id, status: run.status, activeAttemptId: run.activeAttemptId,
+            })),
+            attempts: projection.attempts.map((attempt) => ({
+              id: attempt.id, runId: attempt.runId, status: attempt.status,
+            })),
+            adapterEntries: stub.started.length, activeKeys: yield* executor.activeKeys,
+            clock: DateTime.toEpochMillis(yield* DateTime.now) };
+        });
+        const startCommand = messageCommand(threadId, "held-stop-start");
+        const started = yield* bounded(orchestrator.dispatch(startCommand), "held-stop-start");
+        executing = yield* worker.drain().pipe(Effect.forkScoped);
+        yield* bounded(Deferred.await(entered), "held-stop-preparation-entry");
+        const before = yield* bounded(snapshot(), "held-stop-before");
+        assert.equal(before.effects.length, 1);
+        assert.equal(before.runs.length, 1);
+        assert.equal(before.attempts.length, 1);
+        const originalRun = before.runs[0]!;
+        const originalAttempt = before.attempts[0]!;
+        assert.isNotNull(originalRun.activeAttemptId);
+        assert.equal(originalAttempt.id, originalRun.activeAttemptId);
+        assert.equal(originalAttempt.runId, originalRun.id);
+        const runIds = (state: typeof before) => state.runs.map((run) => run.id).sort();
+        const attemptIds = (state: typeof before) => state.attempts.map((attempt) =>
+          ({ id: attempt.id, runId: attempt.runId })).sort((a, b) => a.id.localeCompare(b.id));
+        const original = before.effects[0]!;
+        assert.equal(original.status, "running");
+        assert.isNotNull(original.lease_owner);
+        assert.equal(original.attempt_count, 1);
+        assert.equal(original.effect_type, "provider-turn.start");
+        assert.equal(before.admissions.length, 1);
+        assert.equal(before.admissions[0]!.command_id,
+          `goal-provider:${original.effect_id}:${original.attempt_count}`);
+        assert.equal(before.admissions[0]!.status, "accepted");
+        assert.equal(before.continuations, 0);
+        assert.equal(before.continuationInterruptions, 0);
+        assert.equal(before.adapterEntries, 1);
+        assert.deepEqual(before.controls, []);
+        const initialPolicy = before.policies.at(-1)!;
+        assert.isDefined(initialPolicy);
+        assert.isNull(initialPolicy.hold);
+        const budget = (policy: typeof initialPolicy) =>
+          ({ used: policy.used, limit: policy.request_limit, grant: policy.grant_id });
+        const holdCommand = { type: "goal.hold" as const,
+          commandId: CommandId.make("held-stop-hold"), threadId, hold: "cancel-while-prepared" };
+        const held = yield* bounded(orchestrator.dispatch(holdCommand), "held-stop-hold");
+        const holdReceipt = yield* bounded(readCommand(holdCommand.commandId), "held-stop-hold-receipt");
+        assert.equal(holdReceipt.length, 1);
+        assert.equal(holdReceipt[0]!.status, "accepted");
+        assert.equal(holdReceipt[0]!.command_type, "goal.hold");
+        assert.equal(holdReceipt[0]!.result_sequence, held.sequence);
+        assert.isTrue(before.admissions[0]!.result_sequence < held.sequence);
+        const gateStart = gate.length;
+        yield* Deferred.succeed(preparationReady, undefined);
+        const matchingRefusal = () => gate.slice(gateStart).find((o) =>
+          o.phase === "failure" && o.threadId === threadId && o.effectId === original.effect_id &&
+          o.attemptCount === original.attempt_count && o.continuation?.leaseOwner === original.lease_owner &&
+          o.causeTag === "GoalDispatchHeldError" && o.causeThreadId === threadId &&
+          o.causeGoalThreadId === threadId && typeof o.heldAfterSequence === "number" &&
+          Number.isSafeInteger(o.heldAfterSequence) && o.heldAfterSequence >= held.sequence);
+        let heldRounds = 0;
+        for (; heldRounds <= maxSchedulerRounds; heldRounds++) {
+          if (overflow || continuations !== 0 || matchingRefusal() !== undefined ||
+              (yield* Effect.sync(() => executing!.pollUnsafe())) !== undefined) break;
+          if (heldRounds < maxSchedulerRounds) yield* Effect.yieldNow;
+        }
+        const refusal = matchingRefusal() ?? null;
+        const heldAtBound = { refusal, continuations, continuationInterruptions,
+          workerExit: (yield* Effect.sync(() => executing!.pollUnsafe()))?._tag ?? "Pending",
+          gate: gate.slice(), overflow, schedulerRounds: Math.min(heldRounds, maxSchedulerRounds) };
+        const whileHeld = yield* bounded(snapshot(), "held-stop-held-snapshot");
+        console.error("DG04_HELD_STOP_HELD", JSON.stringify({ before, holdReceipt, heldAtBound, whileHeld, maxSchedulerRounds }));
+        assert.equal(heldAtBound.continuations, 0);
+        assert.equal(whileHeld.continuations, 0);
+        if (overflow || refusal === null) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "held-stop-real-refusal-unavailable", schedulerRounds: heldAtBound.schedulerRounds,
+        }));
+        assert.equal(heldAtBound.workerExit, "Pending");
+        assert.deepEqual(whileHeld.effects, before.effects);
+        assert.deepEqual(runIds(whileHeld), runIds(before));
+        assert.deepEqual(attemptIds(whileHeld), attemptIds(before));
+        assert.equal(whileHeld.policies.at(-1)!.hold, "cancel-while-prepared");
+        assert.equal(whileHeld.continuationInterruptions, 0);
+        const stopCommand = { type: "thread.stop" as const,
+          commandId: CommandId.make("held-stop-stop"), threadId };
+        const stopped = yield* bounded(orchestrator.dispatch(stopCommand), "held-stop-stop-commit");
+        const stopReceipt = yield* bounded(readCommand(stopCommand.commandId), "held-stop-stop-receipt");
+        const joined = yield* pollFrozen(executing!);
+        const beforeRelease = yield* bounded(snapshot(), "held-stop-after-stop");
+        console.error("DG04_HELD_STOP_STOPPED", JSON.stringify({ stopReceipt, beforeRelease,
+          workerExit: joined.exit?._tag ?? "Pending", schedulerRounds: joined.rounds,
+          gate: gate.slice(), overflow, maxSchedulerRounds }));
+        if (joined.exit === undefined) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "held-stop-worker-cancellation-join", schedulerRounds: joined.rounds,
+        }));
+        assert.isTrue(Exit.isSuccess(joined.exit));
+        assert.equal(stopReceipt.length, 1);
+        assert.equal(stopReceipt[0]!.aggregate_id, threadId);
+        assert.equal(stopReceipt[0]!.command_type, "thread.stop");
+        assert.equal(stopReceipt[0]!.status, "accepted");
+        assert.equal(stopReceipt[0]!.result_sequence, stopped.sequence);
+        assert.isTrue(held.sequence < stopped.sequence);
+        assert.deepEqual(beforeRelease.effects, [{ ...original, status: "cancelled", lease_owner: null }]);
+        assert.deepEqual(runIds(beforeRelease), runIds(before));
+        assert.deepEqual(attemptIds(beforeRelease), attemptIds(before));
+        assert.equal(beforeRelease.runs.find((run) => run.id === originalRun.id)?.status, "interrupted",
+          "The original durable run must be interrupted before release or cleanup");
+        assert.equal(beforeRelease.attempts.find((attempt) => attempt.id === originalAttempt.id)?.status, "interrupted",
+          "The original durable attempt must be interrupted before release or cleanup");
+        assert.equal(beforeRelease.continuations, 0);
+        assert.equal(beforeRelease.continuationInterruptions, 1, "Real continuation interruption must precede release and cleanup");
+        assert.equal(beforeRelease.policies.at(-1)!.hold, "cancel-while-prepared");
+        assert.deepEqual(beforeRelease.activeKeys, []);
+        const releaseCommand = { type: "goal.resume" as const,
+          commandId: CommandId.make("held-stop-release"), threadId };
+        const released = yield* bounded(orchestrator.dispatch(releaseCommand), "held-stop-release");
+        const releaseReceipt = yield* bounded(readCommand(releaseCommand.commandId), "held-stop-release-receipt");
+        yield* bounded(worker.drain(), "held-stop-release-drain");
+        const afterRelease = yield* bounded(snapshot(), "held-stop-released-snapshot");
+        const replayStart = yield* bounded(orchestrator.dispatch(startCommand), "held-stop-replay-start");
+        const replayStop = yield* bounded(orchestrator.dispatch(stopCommand), "held-stop-replay-stop");
+        const replayRelease = yield* bounded(orchestrator.dispatch(releaseCommand), "held-stop-replay-release");
+        yield* bounded(worker.drain(), "held-stop-replay-drain");
+        const afterReplay = yield* bounded(snapshot(), "held-stop-replay-snapshot");
+        console.error("DG04_HELD_STOP_RELEASED_REPLAY", JSON.stringify({ releaseReceipt, afterRelease, afterReplay,
+          originalSequences: [started.sequence, stopped.sequence, released.sequence],
+          replaySequences: [replayStart.sequence, replayStop.sequence, replayRelease.sequence],
+          gate: gate.slice(), overflow, maxSchedulerRounds }));
+        if (overflow) return yield* Effect.fail(new StopProgressInconclusive({
+          stage: "held-stop-observation-overflow", schedulerRounds: maxSchedulerRounds,
+        }));
+        assert.equal(releaseReceipt.length, 1);
+        assert.equal(releaseReceipt[0]!.status, "accepted");
+        assert.equal(releaseReceipt[0]!.command_type, "goal.resume");
+        assert.equal(releaseReceipt[0]!.result_sequence, released.sequence);
+        assert.isTrue(stopped.sequence < released.sequence);
+        assert.deepEqual([replayStart.sequence, replayStop.sequence, replayRelease.sequence],
+          [started.sequence, stopped.sequence, released.sequence]);
+        for (const state of [before, whileHeld, beforeRelease, afterRelease, afterReplay]) {
+          assert.equal(state.clock, 0);
+          assert.equal(state.continuations, 0);
+          assert.equal(state.adapterEntries, 1);
+          assert.deepEqual(state.admissions, before.admissions, "Stop/release must not readmit the cancelled attempt");
+          for (const policy of state.policies.filter((p) => p.sequence >= initialPolicy.sequence)) {
+            assert.deepEqual(budget(policy), budget(initialPolicy));
+          }
+        }
+        for (const state of [beforeRelease, afterRelease, afterReplay]) {
+          assert.deepEqual(state.effects, beforeRelease.effects);
+          assert.deepEqual(runIds(state), runIds(before), "Stop/release must not replace the original run");
+          assert.deepEqual(attemptIds(state), attemptIds(before), "Stop/release must not create or replace an attempt");
+          assert.equal(state.runs.find((run) => run.id === originalRun.id)?.status, "interrupted");
+          assert.equal(state.attempts.find((attempt) => attempt.id === originalAttempt.id)?.status, "interrupted");
+          // Record activeAttemptId, but Stop may clear that pointer. Identity is
+          // bound before hold and checked against the durable run/attempt rows.
+          assert.equal(state.continuationInterruptions, 1);
+          assert.deepEqual(state.controls, [{ command_id: stopCommand.commandId, command_type: "thread.stop",
+            status: "accepted", result_sequence: stopped.sequence }]);
+          assert.deepEqual(state.activeKeys, []);
+        }
+        assert.isNull(afterRelease.policies.at(-1)!.hold);
+        assert.deepEqual(afterReplay.policies, afterRelease.policies);
+      }).pipe(Effect.ensuring(Effect.gen(function* () {
+        const cleanup = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(preparationReady, undefined);
+          if (executing !== undefined) yield* Fiber.interrupt(executing);
+        }).pipe(Effect.forkScoped);
+        const joined = yield* pollFrozen(cleanup);
+        console.error("DG04_HELD_STOP_CLEANUP", JSON.stringify({
+          completed: joined.exit !== undefined && Exit.isSuccess(joined.exit),
+          exit: joined.exit?._tag ?? "Pending", continuations, continuationInterruptions,
+        }));
+        if (joined.exit === undefined || Exit.isFailure(joined.exit)) return yield* Effect.die(
+          new StopProgressInconclusive({ stage: "held-stop-cleanup", schedulerRounds: maxSchedulerRounds }));
+      }).pipe(Effect.orDie))),
+      {
+        captureBaseline: Effect.void,
+        checkpointRepositoryCheck: () => Effect.succeed(false),
+        observeProviderDispatch: observeGate,
+        beforeProviderCall: () => Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(preparationReady);
+        }),
+        afterProviderPreparation: () => Effect.sync(() => { continuations += 1; }),
+        onStartContinuationInterrupted: (threadId) => Effect.sync(() => {
+          if (threadId === ownedThread) continuationInterruptions += 1;
+        }),
+      },
+    );
+  }).pipe(Effect.onExit((exit) => Effect.sync(() => {
+    const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+    console.error("DG04_HELD_STOP_VERDICT", JSON.stringify({
+      status: Exit.isSuccess(exit) ? "PASS_STOP_HELD_CONTINUATION"
+        : error instanceof StopProgressInconclusive ? "INCONCLUSIVE_NOT_QUALIFIED" : "FAIL",
+      stage: error instanceof StopProgressInconclusive ? error.stage : null,
+      cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : null,
+    }));
+  }))),
+);
+
 
 it.effect.each(["start", "steer", "descendant-start", "descendant-steer"] as const)(
   "F3 pending provider $0 permits Stop before release",
