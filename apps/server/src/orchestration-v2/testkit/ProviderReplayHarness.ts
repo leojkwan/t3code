@@ -249,6 +249,8 @@ export interface ProviderDispatchObservation {
   readonly threadId: string;
   readonly effectId: string;
   readonly attemptCount: number;
+  readonly continuation?: { readonly leaseOwner: string | null };
+  readonly heldAfterSequence?: number | null;
   readonly errorTag?: string | null;
   readonly causeTag?: string | null;
   readonly causeThreadId?: string | null;
@@ -523,6 +525,8 @@ export function layerWithRegistry<Error>(
                 const inner = typeof cause === "object" && cause !== null ? cause : undefined;
                 observe({
                   ...input, phase: "failure",
+                  heldAfterSequence: outer !== undefined && "heldAfterSequence" in outer &&
+                    typeof outer.heldAfterSequence === "number" ? outer.heldAfterSequence : null,
                   errorTag: outer !== undefined && "_tag" in outer && typeof outer._tag === "string"
                     ? outer._tag : null,
                   causeTag: inner !== undefined && "_tag" in inner && typeof inner._tag === "string"
@@ -538,6 +542,7 @@ export function layerWithRegistry<Error>(
           });
       return Layer.mock(ThreadManagementService.ThreadManagementService)({
         withProviderDispatch,
+        streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
         dispatch: orchestrator.dispatch,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,

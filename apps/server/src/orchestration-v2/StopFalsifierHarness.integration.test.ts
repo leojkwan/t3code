@@ -48,6 +48,8 @@ import { makeProviderFailure } from "./ProviderFailure.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as GoalHold from "./GoalHold.ts";
+import { ProviderAdapterTurnStartError, ProviderAdapterSteerRunError } from "./ProviderAdapter.ts";
 import * as EventSink from "./EventSink.ts";
 import type {
   ProviderAdapterV2Event,
@@ -93,6 +95,7 @@ const makeStub = (
     turn: ProviderAdapterV2TurnInput,
     emitTerminal: Effect.Effect<void>,
   ) => Effect.Effect<void>,
+  afterProviderPreparation?: (type: "start" | "steer", threadId: ThreadId) => Effect.Effect<void>,
 ) =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
@@ -147,30 +150,42 @@ const makeStub = (
               Effect.gen(function* () {
                 started.push(turn);
                 yield* beforeProviderCall?.("start", turn.threadId) ?? Effect.void;
-                yield* Queue.offer(events, {
-                  type: "provider_turn.updated",
-                  driver,
-                  providerTurn: {
-                    id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
-                    providerThreadId: turn.providerThread.id,
-                    nodeId: turn.rootNodeId,
-                    runAttemptId: turn.attemptId,
-                    nativeTurnRef: {
-                      driver,
-                      nativeId: `native:${turn.attemptId}`,
-                      strength: "strong",
+                yield* GoalHold.guardProviderContinuation(turn.threadId, Effect.gen(function* () {
+                  yield* afterProviderPreparation?.("start", turn.threadId) ?? Effect.void;
+                  yield* Queue.offer(events, {
+                    type: "provider_turn.updated",
+                    driver,
+                    providerTurn: {
+                      id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
+                      providerThreadId: turn.providerThread.id,
+                      nodeId: turn.rootNodeId,
+                      runAttemptId: turn.attemptId,
+                      nativeTurnRef: {
+                        driver,
+                        nativeId: `native:${turn.attemptId}`,
+                        strength: "strong",
+                      },
+                      ordinal: turn.providerTurnOrdinal,
+                      status: "running",
+                      startedAt: now,
+                      completedAt: null,
                     },
-                    ordinal: turn.providerTurnOrdinal,
-                    status: "running",
-                    startedAt: now,
-                    completedAt: null,
-                  },
-                });
+                  });
+                })).pipe(Effect.mapError((cause) => new ProviderAdapterTurnStartError({
+                  driver, threadId: turn.threadId, providerThreadId: turn.providerThread.id,
+                  runId: turn.runId, cause,
+                })));
               }),
             steerTurn: (input) =>
               Effect.gen(function* () {
                 steered.push(input.message.messageId);
                 yield* beforeProviderCall?.("steer", input.threadId) ?? Effect.void;
+                yield* GoalHold.guardProviderContinuation(input.threadId,
+                  afterProviderPreparation?.("steer", input.threadId) ?? Effect.void,
+                ).pipe(Effect.mapError((cause) => new ProviderAdapterSteerRunError({
+                  driver, providerThreadId: input.providerThread.id,
+                  providerTurnId: input.providerTurnId, cause,
+                })));
               }),
             interruptTurn: (interrupt) =>
               Effect.gen(function* () {
@@ -259,6 +274,9 @@ interface PhaseOptions {
   readonly beforeProviderCall?: (
     type: "start" | "steer",
     threadId: ThreadId,
+  ) => Effect.Effect<void>;
+  readonly afterProviderPreparation?: (
+    type: "start" | "steer", threadId: ThreadId,
   ) => Effect.Effect<void>;
   readonly workspacePath?: string;
   // A second runtime over the same stored data: skip thread creation, own layer name.
@@ -637,6 +655,7 @@ const withHarness = <A, E>(
               }
             }
           })).pipe(Effect.orDie),
+        options.afterProviderPreparation,
       );
       let pollScheduled: Effect.Effect<void> = Effect.void;
       return yield* Effect.gen(function* () {
@@ -939,12 +958,16 @@ it.effect("F4 preparation hold resumes the same admitted attempt exactly once af
         assert.equal(afterHold.policies.at(-1)!.hold, "preparation-hold");
         assert.equal(afterHold.continuations, 0);
         // Preparation is now unconditionally ready while the REAL hold is still active.
-        // This fixture creates no refusal, second gate call, hold latch or sleep.
+        // The adapter calls the production continuation boundary after preparation.
+        // This fixture creates no refusal, hold latch or sleep.
         const heldGateStart = gate.length;
         yield* Deferred.succeed(preparationReady, undefined);
         const matchingRefusal = () => gate.slice(heldGateStart).find((o) =>
           o.phase === "failure" && o.effectId === exact.effect_id &&
           o.attemptCount === exact.attempt_count && o.threadId === threadId &&
+          o.continuation?.leaseOwner === exact.lease_owner &&
+          typeof o.heldAfterSequence === "number" && Number.isSafeInteger(o.heldAfterSequence) &&
+          o.heldAfterSequence >= held.sequence &&
           o.causeTag === "GoalDispatchHeldError" && o.causeThreadId === threadId &&
           o.causeGoalThreadId === threadId);
         let heldRounds = 0;
@@ -1053,8 +1076,8 @@ it.effect("F4 preparation hold resumes the same admitted attempt exactly once af
           yield* Deferred.succeed(entered, undefined);
           yield* Deferred.await(preparationReady).pipe(Effect.onInterrupt(() =>
             Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid)));
-          continuations += 1;
         }),
+        afterProviderPreparation: () => Effect.sync(() => { continuations += 1; }),
       },
     );
   }).pipe(Effect.onExit((exit) => Effect.sync(() => {

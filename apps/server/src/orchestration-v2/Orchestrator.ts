@@ -283,6 +283,7 @@ export interface OrchestratorV2Shape {
       readonly threadId: ThreadId;
       readonly effectId: string;
       readonly attemptCount: number;
+      readonly continuation?: { readonly leaseOwner: string | null };
     },
     work: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | GoalHold.GoalProviderDispatchError, R>;
@@ -895,6 +896,44 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       input.threadId,
       Effect.gen(function* () {
         const commandId = CommandId.make(`goal-provider:${input.effectId}:${input.attemptCount}`);
+        const continuation = input.continuation;
+        if (continuation !== undefined) {
+          return yield* Effect.gen(function* () {
+            const root = yield* goalThreadId(input.threadId);
+            const claimed = yield* effectOutbox.get(input.effectId);
+            const prior = yield* commandReceipts.getByCommandId(commandId);
+            if (
+              Option.isNone(claimed) || claimed.value.threadId !== input.threadId ||
+              claimed.value.status !== "running" || claimed.value.attemptCount !== input.attemptCount ||
+              continuation.leaseOwner === null ||
+              claimed.value.leaseOwner !== continuation.leaseOwner ||
+              Option.isNone(prior) || prior.value.status !== "accepted" ||
+              prior.value.threadId !== root || prior.value.commandType !== "goal.provider-dispatch"
+            ) {
+              return yield* new GoalHold.GoalProviderDispatchError({
+                threadId: input.threadId,
+                cause: "Continuation requires the same claimed lease and accepted provider admission.",
+              });
+            }
+            // Cursor precedes the policy read under the goal lock. A release
+            // before subscription remains available through committed replay.
+            const afterSequence = yield* eventStore.latestSequence();
+            const policy = yield* readGoalPolicy(root);
+            const refused = GoalHold.refusal(policy, input.threadId, root, 0);
+            if (refused !== undefined) {
+              return yield* new GoalHold.GoalProviderDispatchError({
+                threadId: input.threadId,
+                cause: refused,
+                ...(Schema.is(GoalHold.GoalDispatchHeldError)(refused)
+                  ? { heldAfterSequence: afterSequence } : {}),
+              });
+            }
+            return yield* Effect.forkChild(work, { startImmediately: true });
+          }).pipe(Effect.mapError((cause) =>
+            Schema.is(GoalHold.GoalProviderDispatchError)(cause)
+              ? cause : new GoalHold.GoalProviderDispatchError({ threadId: input.threadId, cause }),
+          ));
+        }
         const admission = Effect.gen(function* () {
           // The first attempt was reserved with its outbox request. A retry is
           // another possible provider request and requires another budget slot.

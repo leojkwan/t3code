@@ -5,7 +5,11 @@ import * as Effect from "effect/Effect";
 
 export class GoalProviderDispatchError extends Schema.TaggedError<GoalProviderDispatchError>()(
   "GoalProviderDispatchError",
-  { threadId: ThreadId, cause: Schema.optional(Schema.Defect()) },
+  {
+    threadId: ThreadId,
+    cause: Schema.optional(Schema.Defect()),
+    heldAfterSequence: Schema.optional(Schema.Number),
+  },
 ) {}
 
 export interface ProviderDispatchGuardShape {
@@ -13,6 +17,7 @@ export interface ProviderDispatchGuardShape {
     threadId: ThreadId,
     work: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | GoalProviderDispatchError, R>;
+  readonly continue?: ProviderDispatchGuardShape["run"];
 }
 
 /** The outbox supplies custody; the provider services place it at the actual call. */
@@ -25,6 +30,12 @@ export class ProviderDispatchGuard extends Context.Reference<
 export const guardProviderCall = <A, E, R>(threadId: ThreadId, work: Effect.Effect<A, E, R>) =>
   Effect.flatMap(ProviderDispatchGuard, (guard) =>
     guard === undefined ? work : guard.run(threadId, work),
+  );
+
+/** Recheck after adapter preparation, without reserving a second request. */
+export const guardProviderContinuation = <A, E, R>(threadId: ThreadId, work: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(ProviderDispatchGuard, (guard) =>
+    guard?.continue === undefined ? work : guard.continue(threadId, work),
   );
 
 export class GoalDispatchHeldError extends Schema.TaggedError<GoalDispatchHeldError>()(

@@ -9,6 +9,8 @@ import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Result from "effect/Result";
+import * as Stream from "effect/Stream";
 
 import {
   increment,
@@ -109,11 +111,57 @@ export const layerExecutor: Layer.Layer<
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         const guard: GoalHold.ProviderDispatchGuardShape = {
-          run: (threadId, work) =>
-            threads.withProviderDispatch(
-              { threadId, effectId: effect.id, attemptCount: effect.attemptCount },
-              work,
-            ),
+          run: (threadId, work) => Effect.suspend(() => {
+            const input = { threadId, effectId: effect.id, attemptCount: effect.attemptCount };
+            let continuationEntered = false;
+            const admittedGuard: GoalHold.ProviderDispatchGuardShape = {
+              ...guard,
+              continue: (target, continuation) => Effect.gen(function* () {
+                if (target !== threadId || continuationEntered) {
+                  return yield* new GoalHold.GoalProviderDispatchError({
+                    threadId: target,
+                    cause: "An admitted attempt has one matching provider continuation.",
+                  });
+                }
+                continuationEntered = true;
+                let workEntered = false;
+                while (true) {
+                  const checked = yield* Effect.result(threads.withProviderDispatch(
+                    { ...input, continuation: { leaseOwner: effect.leaseOwner } },
+                    Effect.suspend(() => {
+                      workEntered = true;
+                      return continuation;
+                    }),
+                  ));
+                  if (Result.isSuccess(checked)) return checked.success;
+                  const error = checked.failure;
+                  if (workEntered || !Schema.is(GoalHold.GoalProviderDispatchError)(error) ||
+                      !Schema.is(GoalHold.GoalDispatchHeldError)(error.cause) ||
+                      error.heldAfterSequence === undefined) return yield* Effect.fail(error);
+                  // Replay closes the refusal-to-subscription race. This only
+                  // wakes the same fiber; the lock-protected check still decides.
+                  const release = yield* threads.streamStoredEventsFrom({
+                    threadId: error.cause.goalThreadId,
+                    afterSequence: error.heldAfterSequence,
+                    eventType: "goal.dispatch-policy.updated",
+                  }).pipe(
+                    Stream.filter(({ event }) => event.type === "goal.dispatch-policy.updated" &&
+                      event.payload.hold === null),
+                    Stream.runHead,
+                    Effect.mapError((cause) => new GoalHold.GoalProviderDispatchError({
+                      threadId, cause,
+                    })),
+                  );
+                  if (Option.isNone(release)) return yield* new GoalHold.GoalProviderDispatchError({
+                    threadId, cause: "The committed policy stream ended before release.",
+                  });
+                }
+              }),
+            };
+            return threads.withProviderDispatch(input, work.pipe(
+              Effect.provideService(GoalHold.ProviderDispatchGuard, admittedGuard),
+            ));
+          }),
         };
         switch (effect.request.type) {
           case "provider-runtime.continue": {

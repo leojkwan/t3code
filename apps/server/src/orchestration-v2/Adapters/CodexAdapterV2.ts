@@ -122,6 +122,7 @@ import {
   type ProviderAdapterDriverCreateInput,
 } from "../ProviderAdapterDriver.ts";
 import { IdAllocatorV2, type IdAllocatorV2Shape } from "../IdAllocator.ts";
+import * as GoalHold from "../GoalHold.ts";
 import {
   type ProviderContinuationRequest,
   ProviderContinuationRequests,
@@ -6200,7 +6201,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               else next.delete(threadId);
               return next;
             });
-            const started = yield* client.request("turn/start", turnStartParams);
+            const started = yield* GoalHold.guardProviderContinuation(
+              turnInput.threadId,
+              client.request("turn/start", turnStartParams),
+            );
             yield* registerRootTurn({
               turnInput,
               nativeTurnId: started.turn.id,
@@ -6646,11 +6650,13 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               }
 
               const codexInput = yield* toCodexInput(turnInput);
-              yield* client.request("turn/steer", {
-                expectedTurnId: activeTurn.nativeTurnId,
-                input: codexInput,
-                threadId,
-              });
+              yield* GoalHold.guardProviderContinuation(turnInput.threadId,
+                client.request("turn/steer", {
+                  expectedTurnId: activeTurn.nativeTurnId,
+                  input: codexInput,
+                  threadId,
+                }),
+              );
             }).pipe(
               Effect.mapError(
                 (cause) =>
