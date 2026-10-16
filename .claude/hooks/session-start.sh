@@ -11,9 +11,18 @@ fi
 
 cd "${CLAUDE_PROJECT_DIR:-.}"
 
+# Matches the root package.json engines range (^24.13.1).
+node_supported() {
+  "$1" -e '
+    const [major, minor, patch] = process.versions.node.split(".").map(Number);
+    process.exit(major === 24 && (minor > 13 || (minor === 13 && patch >= 1)) ? 0 : 1);
+  ' 2>/dev/null
+}
+
 NODE_DIR="$HOME/.local/node24"
-if ! node -e 'process.exit(parseInt(process.versions.node, 10) >= 24 ? 0 : 1)' 2>/dev/null; then
-  if [ ! -x "$NODE_DIR/bin/node" ]; then
+if ! node_supported node; then
+  if ! node_supported "$NODE_DIR/bin/node"; then
+    rm -rf "$NODE_DIR"
     mkdir -p "$NODE_DIR"
     version=$(curl -fsSL https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt \
       | sed -n 's/.*node-\(v[0-9.]*\)-linux-x64\.tar\.xz$/\1/p' | head -1)
