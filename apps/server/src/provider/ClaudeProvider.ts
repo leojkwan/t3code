@@ -283,7 +283,10 @@ type ClaudeCapabilitiesProbe = {
    * `undefined` when the request itself failed. Absent windows on an
    * otherwise successful response mean the account has none (API key).
    */
-  readonly usage?: Pick<SDKControlGetUsageResponse, "rate_limits_available" | "rate_limits">;
+  readonly usage?: Pick<SDKControlGetUsageResponse, "rate_limits_available" | "rate_limits"> & {
+    /** Actual SDK usage-response observation, preserved by the capabilities cache. */
+    readonly observedAt: string;
+  };
 };
 
 function parseClaudeInitializationCommands(
@@ -412,13 +415,20 @@ const probeClaudeCapabilities = (
         const usageResult = includeUsage
           ? yield* Effect.tryPromise(() =>
               q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
-            ).pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result)
+            ).pipe(
+              Effect.timeout(DEFAULT_TIMEOUT_MS),
+              Effect.flatMap((response) => DateTime.now.pipe(
+                Effect.map((observedAt) => ({ ...response, observedAt: DateTime.formatIso(observedAt) })),
+              )),
+              Effect.result,
+            )
           : undefined;
         const usage =
           usageResult && Result.isSuccess(usageResult)
             ? {
                 rate_limits_available: usageResult.success.rate_limits_available,
                 rate_limits: usageResult.success.rate_limits,
+                observedAt: usageResult.success.observedAt,
               }
             : undefined;
         const account = init.account as
@@ -654,14 +664,16 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       subscriptionType: capabilities.subscriptionType,
       authMethod: capabilities.tokenSource,
     }) ?? apiProviderAuthMetadata(capabilities.apiProvider);
-  const usageLimits = !capabilities.usage
+  const usageLimits = !capabilities.usage?.observedAt
     ? makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" })
     : scopedLimitNames
       ? yield* recordClaudeUsageResponse(scopedLimitNames, {
           response: capabilities.usage,
-          checkedAt,
+          checkedAt: capabilities.usage.observedAt,
         })
-      : claudeUsageResponseToLimits({ response: capabilities.usage, checkedAt }).limits;
+      : claudeUsageResponseToLimits({
+          response: capabilities.usage, checkedAt: capabilities.usage.observedAt,
+        }).limits;
   const resetCredits =
     resolveResetCredits &&
     capabilities.subscriptionType &&

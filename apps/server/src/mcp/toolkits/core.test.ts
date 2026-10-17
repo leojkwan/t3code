@@ -13,11 +13,14 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
+  type OrchestrationV2ServerCommand,
   ThreadId,
   TurnItemId,
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
@@ -490,6 +493,271 @@ it.effect("a client caller targets any thread within its ceiling and cannot act 
   ),
 );
 
+it.effect.each(["omitted", "explicit"] as const)(
+  "refuses active self-configuration with an %s target before allocating or dispatching",
+  (target) => {
+    const shell = McpToolAccessTestkit.liveThreadShell(threadId);
+    const commands: Array<OrchestrationV2ServerCommand> = [];
+    let randomRequests = 0;
+    const crypto = Crypto.make({
+      randomBytes: (size) => {
+        randomRequests += 1;
+        return new Uint8Array(size).fill(7);
+      },
+      digest: (_algorithm, data) => Effect.succeed(data),
+    });
+    const selections = [
+      { instanceId: "codex", model: "gpt-6-astra" },
+      { ...shell.modelSelection, options: [{ id: "effort", value: "xhigh" }] },
+      { ...shell.modelSelection, options: [{ id: "serviceTier", value: "priority" }] },
+      { instanceId: "claude", model: "claude-opus-5-5" },
+      shell.modelSelection,
+    ];
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const modelSelection of selections) {
+        const result = yield* server
+          .callTool({
+            name: "t3_thread_configure",
+            arguments: {
+              ...(target === "explicit" ? { threadId } : {}),
+              modelSelection,
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+        expect(declaredFailure(result), JSON.stringify(modelSelection)).toMatchObject({
+          code: "invalid_request",
+          message: expect.stringContaining("An active agent cannot configure its own thread"),
+        });
+        expect(declaredFailure(result).message).toContain("t3_thread_configuration");
+        expect(declaredFailure(result).message).toContain("after this run finishes");
+        expect(commands).toEqual([]);
+        expect(randomRequests).toBe(0);
+      }
+      const read = yield* server
+        .callTool({ name: "t3_thread_configuration", arguments: {} })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(read.isError).toBe(false);
+      expect(read.structuredContent).toMatchObject({
+        threadId,
+        modelSelection: shell.modelSelection,
+      });
+      expect(commands).toEqual([]);
+      expect(randomRequests).toBe(0);
+      // This is the MCP boundary: a useful native caller finish still needs live proof.
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: () => Effect.succeed(shell),
+              getProjectThreadRecords: () =>
+                Effect.succeed(McpToolAccessTestkit.idleThreadProjection(shell)),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return { sequence: 7, storedEvents: [] };
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect.each(["selection", "Stop"] as const)(
+  "refuses self-configuration when %s changes after the target snapshot",
+  (change) => {
+    let shell = McpToolAccessTestkit.liveThreadShell(threadId);
+    const originalSelection = shell.modelSelection;
+    const commands: Array<OrchestrationV2ServerCommand> = [];
+    let randomRequests = 0;
+    let snapshotReads = 0;
+    const crypto = Crypto.make({
+      randomBytes: (size) => {
+        randomRequests += 1;
+        return new Uint8Array(size).fill(7);
+      },
+      digest: (_algorithm, data) => Effect.succeed(data),
+    });
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const result = yield* server
+        .callTool({
+          name: "t3_thread_configure",
+          arguments: { threadId, modelSelection: originalSelection },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(snapshotReads).toBe(1);
+      expect(declaredFailure(result)).toMatchObject({ code: "invalid_request" });
+      expect(commands).toEqual([]);
+      expect(randomRequests).toBe(0);
+      if (change === "selection") {
+        expect(shell.modelSelection.model).toBe("gpt-6-astra");
+      } else {
+        expect(shell.activeRunId).toBeNull();
+        expect(shell.status).toBe("interrupted");
+      }
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: () => Effect.succeed(shell),
+              getProjectThreadRecords: () =>
+                Effect.sync(() => {
+                  snapshotReads += 1;
+                  const snapshot = McpToolAccessTestkit.idleThreadProjection(shell);
+                  shell =
+                    change === "selection"
+                      ? { ...shell, modelSelection: { ...shell.modelSelection, model: "gpt-6-astra" } }
+                      : { ...shell, activeRunId: null, status: "interrupted" };
+                  return snapshot;
+                }),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return { sequence: 7, storedEvents: [] };
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect.each(["cross-thread", "external client"] as const)(
+  "keeps permitted configuration dispatch for a %s",
+  (caller) => {
+    const targetId = ThreadId.make("configure-other-thread");
+    const commands: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const modelSelection of [
+        { instanceId: "codex", model: "gpt-6-astra" },
+        { instanceId: "claude", model: "claude-opus-5-5" },
+      ]) {
+        const result = yield* server
+          .callTool({
+            name: "t3_thread_configure",
+            arguments: { threadId: targetId, modelSelection },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              caller === "cross-thread" ? scope : clientScope("full-access"),
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toEqual({ sequence: 7 });
+        expect(commands.at(-1)).toMatchObject({
+          type:
+            modelSelection.instanceId === "codex" ? "thread.model-selection.set" : "provider.switch",
+          threadId: targetId,
+          modelSelection,
+        });
+      }
+      expect(commands).toHaveLength(2);
+      expect(new Set(commands.map((command) => command.commandId)).size).toBe(2);
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+              getProjectThreadRecords: ({ threadId: id }) =>
+                Effect.succeed(
+                  McpToolAccessTestkit.idleThreadProjection(McpToolAccessTestkit.liveThreadShell(id)),
+                ),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return { sequence: 7, storedEvents: [] };
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect.each(["ended", "Stop-ended", "above caller modes"] as const)(
+  "keeps the existing configure refusal for a target %s",
+  (state) => {
+    const targetId =
+      state === "above caller modes" ? ThreadId.make("configure-above-thread") : threadId;
+    const commands: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const result = yield* server
+        .callTool({
+          name: "t3_thread_configure",
+          arguments: {
+            threadId: targetId,
+            modelSelection: { instanceId: "codex", model: "gpt-6-astra" },
+          },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(declaredFailure(result)).toMatchObject({
+        code: state === "above caller modes" ? "runtime_mode_escalation_denied" : "parent_not_active",
+      });
+      expect(commands).toEqual([]);
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: (id) => {
+                const runtimeMode =
+                  state === "above caller modes" && id === threadId ? "auto" : "full-access";
+                const shell = McpToolAccessTestkit.liveThreadShell(id, {
+                  runtimeMode,
+                  ...(state === "above caller modes" ? {} : { activeRunId: null }),
+                });
+                return Effect.succeed({
+                  ...shell,
+                  ...(state === "ended" ? { status: "completed" as const } : {}),
+                  ...(state === "Stop-ended" ? { status: "interrupted" as const } : {}),
+                });
+              },
+              getProjectThreadRecords: () => Effect.die("refuse before reading target records"),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return { sequence: 7, storedEvents: [] };
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
 it.effect("a read-only client reads threads and is refused every write before it runs", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -879,3 +1147,51 @@ it.effect("only the caller that prepared a pending upload can discard it", () =>
     ),
   ),
 );
+
+it.effect("exposes native dismissal and records MCP answers as agent input under the existing access gate", () => {
+  const shell = McpToolAccessTestkit.liveThreadShell(threadId);
+  const requestId = RuntimeRequestId.make("mcp-async-question");
+  const nodeId = NodeId.make("mcp-async-question-node");
+  const commands: OrchestrationV2ServerCommand[] = [];
+  const projection = { ...McpToolAccessTestkit.idleThreadProjection(shell),
+    runtimeRequests: [{ id: requestId, nodeId, providerTurnId: null, nativeRequestRef: null,
+      kind: "user_input" as const, status: "pending" as const, responseCapability: { type: "message" as const },
+      createdAt: shell.createdAt, resolvedAt: null,
+    }],
+    turnItems: [{ id: TurnItemId.make("mcp-async-question-item"), type: "user_input_request" as const,
+      threadId, runId: shell.activeRunId, nodeId, providerThreadId: null, providerTurnId: null,
+      nativeItemRef: null, parentItemId: null, ordinal: 0, status: "waiting" as const,
+      title: null, startedAt: shell.createdAt, completedAt: null, updatedAt: shell.createdAt,
+      requestId, responseMode: "message" as const,
+      questions: [{ id: "color", header: "Color", question: "Which color?", options: [] }],
+    }],
+  };
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (name: string, args: Record<string, unknown>, invocation = scope) =>
+      server.callTool({ name, arguments: args }).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    const dismissed = yield* call("t3_pending_request_dismiss", { requestId });
+    expect(dismissed.isError).not.toBe(true);
+    expect(commands[0]).toMatchObject({ type: "thread.user-input.dismiss", threadId, requestId });
+    const answered = yield* call("t3_pending_request_respond", { requestId, answers: { color: "Blue" } });
+    expect(answered.isError).not.toBe(true);
+    expect(commands[1]).toMatchObject({ type: "runtime-request.respond", threadId, requestId,
+      answers: { color: "Blue" }, createdBy: "agent", creationSource: "mcp",
+    });
+    const denied = yield* call("t3_pending_request_dismiss", { requestId }, { ...scope, capabilities: new Set<never>() });
+    expect(declaredFailure(denied)).toMatchObject({ code: "capability_denied" });
+    const foreign = yield* call("t3_pending_request_respond", { requestId: "missing-request", answers: { color: "Blue" } });
+    expect(declaredFailure(foreign)).toMatchObject({ code: "invalid_request" });
+    expect(commands).toHaveLength(2);
+  }).pipe(Effect.provide(layerThreadToolkit.pipe(
+    Layer.provideMerge(McpServer.McpServer.layer), Layer.provide(NodeCrypto.layer),
+    Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadShell: () => Effect.succeed(shell),
+      getProjectThreadRecords: () => Effect.succeed(projection),
+      dispatch: (command) => Effect.sync(() => { commands.push(command); return { sequence: 7, storedEvents: [] }; }),
+    })),
+  )));
+});

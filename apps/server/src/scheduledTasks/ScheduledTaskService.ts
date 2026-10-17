@@ -45,6 +45,8 @@ import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
   redactHeaders,
@@ -396,6 +398,10 @@ export const layer = Layer.effect(
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
+    const nativeAdmission = yield* Effect.serviceOption(RpcAuthorization.OriginalTaskRecoveryAdmission);
+    const authSessions = yield* Effect.serviceOption(SessionStore.SessionStore);
+    const scheduledAdmission = Option.isSome(nativeAdmission)
+      ? nativeAdmission.value.withScheduledTaskAdmission : undefined;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
     // Webhook deliveries for one task dispatch in arrival order rather than
     // being dropped while an earlier delivery is still dispatching.
@@ -631,7 +637,7 @@ export const layer = Layer.effect(
     // Run-state transitions use targeted UPDATEs (never the full-row upsert) so
     // a completing run cannot resurrect a deleted task or clobber concurrent
     // edits to the task definition.
-    const markRunning = (id: ScheduledTaskId, startedAtIso: string) =>
+    const markRunning = (id: ScheduledTaskId, startedAtIso: string, expected: ScheduledTaskRow) =>
       sql<{ task_id: string }>`
         UPDATE scheduled_tasks
         SET updated_at = ${startedAtIso},
@@ -639,6 +645,21 @@ export const layer = Layer.effect(
             last_run_status = 'running',
             last_run_error = NULL
         WHERE task_id = ${id}
+          AND updated_at = ${expected.updated_at}
+          AND created_at = ${expected.created_at}
+          AND enabled = ${expected.enabled}
+          AND next_run_at IS ${expected.next_run_at}
+          AND title = ${expected.title}
+          AND prompt = ${expected.prompt}
+          AND project_id = ${expected.project_id}
+          AND thread_id IS ${expected.thread_id}
+          AND schedule_json = ${expected.schedule_json}
+          AND model_selection_json = ${expected.model_selection_json}
+          AND workspace_strategy_json = ${expected.workspace_strategy_json}
+          AND runtime_mode = ${expected.runtime_mode}
+          AND interaction_mode = ${expected.interaction_mode}
+          AND created_by = ${expected.created_by}
+          AND creation_source = ${expected.creation_source}
         RETURNING task_id
       `.pipe(
         Effect.mapError((cause) =>
@@ -646,7 +667,9 @@ export const layer = Layer.effect(
         ),
         // A task deleted after the re-read must not be dispatched from the stale snapshot.
         Effect.flatMap((rows) =>
-          rows.length > 0 ? Effect.void : taskError("Schedule task not found.", { taskId: id }),
+            rows.length > 0 ? Effect.void : taskError("Scheduled task changed before dispatch.", {
+              taskId: id, cause: new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "task_changed" }),
+            }),
         ),
       );
 
@@ -732,7 +755,10 @@ export const layer = Layer.effect(
         // The in-memory snapshot may be stale: re-read before touching run
         // state. The task may have been deleted, paused, or postponed since
         // the poll loaded it — none of those may fire.
-        const active = yield* findTask(task.id);
+        const activeRows = yield* getRows(task.id).pipe(Effect.mapError((cause) =>
+          taskError("Could not load schedule task.", { taskId: task.id, cause })));
+        const activeRow = activeRows[0];
+        const active = activeRow === undefined ? null : yield* decodeRow(activeRow, yield* readWebhookOrigin);
         if (active === null) {
           if (webhook !== undefined) {
             return yield* new WebhookDeliverySkipped({
@@ -773,9 +799,6 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        yield* markRunning(active.id, startedAtIso);
-        yield* notifyChanged;
-
         // A webhook run is keyed by its delivery so the same delivery can
         // never dispatch twice.
         const fireKey =
@@ -789,46 +812,64 @@ export const layer = Layer.effect(
         // from the row when the request arrived.
         const prompt = webhook?.prompt ?? active.prompt;
 
+        if (trigger === "scheduled" && scheduledAdmission === undefined) {
+          return yield* taskError("Scheduled task native binding is unavailable.", {
+            taskId: active.id,
+            cause: new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "scheduled_binding_unavailable" }),
+          });
+        }
+        const dispatch = Effect.gen(function* () {
+          // Admission preparation can wait on native/host I/O. Its callback
+          // re-reads the task before any dispatch effect is produced.
+          const current = yield* findTask(active.id);
+          if (current === null || JSON.stringify(current) !== JSON.stringify(active)) {
+            return yield* taskError("Scheduled task changed during admission.", {
+              taskId: active.id,
+              cause: new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "task_changed" }),
+            });
+          }
+          yield* markRunning(active.id, startedAtIso, activeRow!);
+          yield* notifyChanged;
+          return yield* active.threadId === null
+            ? threadLaunch.launch({
+                commandId, projectId: active.projectId, title: active.title,
+                modelSelection: active.modelSelection, runtimeMode: active.runtimeMode,
+                interactionMode: active.interactionMode, workspaceStrategy: active.workspaceStrategy,
+                initialMessage: { messageId, scheduledTaskId: active.id, text: prompt, attachments: [] },
+                createdBy: trigger === "scheduled" ? "agent" : active.createdBy,
+                creationSource: trigger === "scheduled" ? "server" : active.creationSource,
+              })
+            : threadManagement.sendToThread({
+                projectId: active.projectId, commandId, threadId: ThreadId.make(active.threadId),
+                messageId, scheduledTaskId: active.id, text: prompt, attachments: [],
+                modelSelection: active.modelSelection, mode: "queue",
+                createdBy: trigger === "scheduled" ? "agent" : active.createdBy,
+                creationSource: trigger === "scheduled" ? "server" : active.creationSource,
+              });
+        });
+        const admittedDispatch = trigger !== "scheduled" ? dispatch :
+          scheduledAdmission!({
+            type: "scheduled_fire", task: active, commandId, messageId, firedAt: startedAtIso,
+          }, (binding) => Effect.gen(function* () {
+            if (Option.isNone(authSessions)) return yield* new RpcAuthorization.ScheduledTaskAdmissionRefused({
+              reason: "session_authority_unavailable",
+            });
+            // Only this short verification owns the auth mutex; dispatch and
+            // every external read run after it. Canonical dispatch verifies it again.
+            yield* authSessions.value.withCurrentAuthorization(binding.session, Effect.void);
+            return yield* dispatch.pipe(
+              Effect.provideService(RpcAuthorization.AuthenticatedSession, binding.session),
+              Effect.provideService(RpcAuthorization.AuthenticatedSessionPurpose, binding.session.purpose),
+              Effect.provideService(RpcAuthorization.AuthenticatedScheduledTaskFire, {
+                type: "scheduled_fire", task: active, commandId, messageId, firedAt: startedAtIso,
+              }),
+            );
+          }));
+
         // Effect.exit (not Effect.result) so defects and interruptions in the
         // dispatch are also captured and recorded as a failed run instead of
         // aborting before markCompleted.
-        const result =
-          active.threadId === null
-            ? yield* Effect.exit(
-                threadLaunch.launch({
-                  commandId,
-                  projectId: active.projectId,
-                  title: active.title,
-                  modelSelection: active.modelSelection,
-                  runtimeMode: active.runtimeMode,
-                  interactionMode: active.interactionMode,
-                  workspaceStrategy: active.workspaceStrategy,
-                  initialMessage: {
-                    messageId,
-                    scheduledTaskId: active.id,
-                    text: prompt,
-                    attachments: [],
-                  },
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
-              )
-            : yield* Effect.exit(
-                threadManagement.sendToThread({
-                  projectId: active.projectId,
-                  commandId,
-                  threadId: ThreadId.make(active.threadId),
-                  messageId,
-                  scheduledTaskId: active.id,
-                  text: prompt,
-                  attachments: [],
-                  modelSelection: active.modelSelection,
-                  // Scheduled prompts must not interrupt tools in the bound thread.
-                  mode: "queue",
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
-              );
+        const result = yield* Effect.exit(admittedDispatch);
 
         const completedAt = yield* localNow;
         const runSucceeded = result._tag === "Success";

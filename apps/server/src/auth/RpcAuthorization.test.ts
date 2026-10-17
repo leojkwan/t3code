@@ -1,11 +1,19 @@
 import {
   AuthEnvironmentMaintainScope,
+  EnvironmentAuthorizationError,
   AuthDiagnosticsReadScope,
   AuthFilesystemReadScope,
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
   ProviderInstanceId,
+  ProjectId,
+  CommandId,
+  MessageId,
+  RunId,
+  RuntimeRequestId,
+  TurnItemId,
+  NodeId,
   ThreadId,
   AuthOrchestrationOperateScope,
   ORCHESTRATION_V2_WS_METHODS,
@@ -449,5 +457,128 @@ it.effect("denies manual cleanup before the handler without settings permission"
       requiredPermission: AuthSettingsWriteScope,
     });
     expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it("refuses unknown typed recovery and classified automation work while keeping Stop and cancellation available", () => {
+  const message = { type: "message.dispatch" as const, commandId: CommandId.make("purpose-command"), threadId: ThreadId.make("purpose-target"),
+    messageId: MessageId.make("purpose-message"), text: "agent recovery", attachments: [], createdBy: "user" as const, creationSource: "web" as const,
+    dispatchMode: { type: "start_immediately" as const },
+  };
+  const recovery = { ...message, automationContinuation: { sourceRunId: RunId.make("original-run"), originalInputMessageId: MessageId.make("original-input") } };
+  expect(RpcAuthorization.automationCommandRefusal(null, recovery)).toContain("issuer-classified");
+  expect(RpcAuthorization.automationCommandRefusal("human", recovery)).toContain("issuer-classified");
+  expect(RpcAuthorization.automationCommandRefusal("automation", recovery)).toBe(RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+  expect(RpcAuthorization.automationCommandRefusal("automation", { ...recovery, text: "" }, true)).toBeUndefined();
+  expect(RpcAuthorization.automationCommandRefusal("automation", recovery, true)).toBe(RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+  expect(RpcAuthorization.automationCommandRefusal(null, { ...recovery, text: "" }, true)).toContain("issuer-classified");
+  expect(RpcAuthorization.automationCommandRefusal("automation", { ...message, senderThreadId: ThreadId.make("forged") })).toBe(RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+  expect(RpcAuthorization.automationCommandRefusal(null, message)).toBeUndefined();
+  for (const type of ["thread.model-selection.set", "provider.switch"] as const) {
+    expect(RpcAuthorization.automationCommandRefusal("automation", { type,
+      commandId: message.commandId, threadId: message.threadId,
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+    })).toBe(RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+  }
+  const cancellation = { type: "runtime-request.respond" as const, commandId: message.commandId,
+    threadId: message.threadId, requestId: RuntimeRequestId.make("cancel-question"), decision: "cancel" as const,
+  };
+  expect(RpcAuthorization.automationCommandRefusal("automation", cancellation)).toBeUndefined();
+  expect(RpcAuthorization.automationCommandRefusal("automation", {
+    type: "secret_request.record", commandId: message.commandId, threadId: message.threadId,
+    runId: RunId.make("original-run"), nodeId: NodeId.make("native-node"), turnItemId: TurnItemId.make("native-secret"),
+    label: "Native control", reason: "Retained state", secretStatus: "cancelled",
+  })).toBeUndefined();
+  expect(RpcAuthorization.automationCommandRefusal("automation", { ...cancellation, answers: { approval: "yes" } })).toBe(RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+
+  expect(RpcAuthorization.automationCommandRefusal("automation", { type: "run.interrupt", commandId: message.commandId, threadId: message.threadId, runId: RunId.make("original-run"), holdQueue: true })).toBeUndefined();
+});
+
+it.effect("refuses automation launch RPCs before the handler even when operate scope is present", () =>
+  Effect.gen(function* () {
+    const tested = [WS_METHODS.serverProbe, ORCHESTRATION_V2_WS_METHODS.launchThread, WS_METHODS.serverRetryResourceTelemetry] as const;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof tested)[number]> =>
+          !(tested as ReadonlyArray<string>).includes(tag),
+      ),
+    );
+    const handled: string[] = [];
+    const client = yield* RpcTest.makeClient(group).pipe(Effect.provide(Layer.mergeAll(
+      group.toLayerHandler(WS_METHODS.serverProbe, () => Effect.succeed({})),
+      group.toLayerHandler(ORCHESTRATION_V2_WS_METHODS.launchThread, () =>
+        Effect.sync(() => handled.push("launch")).pipe(Effect.andThen(Effect.never))),
+      group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
+        Effect.sync(() => handled.push("retry")).pipe(Effect.andThen(Effect.never))),
+      RpcAuthorization.layer([AuthOrchestrationReadScope, AuthOrchestrationOperateScope, AuthEnvironmentMaintainScope], "automation"),
+    )));
+    expect(yield* client[WS_METHODS.serverProbe]({})).toEqual({});
+    const refused = yield* client[ORCHESTRATION_V2_WS_METHODS.launchThread]({
+      commandId: CommandId.make("automation-launch-rpc"), projectId: ProjectId.make("automation-project"),
+      title: "Automation launch", modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+      runtimeMode: "full-access", interactionMode: "default", workspaceStrategy: { type: "root" },
+    }).pipe(Effect.flip);
+    expect(refused).toMatchObject({ _tag: "EnvironmentAuthorizationError", message: RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE });
+    const maintenanceRefused = yield* client[WS_METHODS.serverRetryResourceTelemetry]({}).pipe(Effect.flip);
+    expect(maintenanceRefused).toMatchObject({
+      _tag: "EnvironmentAuthorizationError", requiredScope: AuthEnvironmentMaintainScope,
+      message: RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE,
+    });
+    expect(handled).toEqual([]);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("refuses a stale captured socket before even its readable RPC handler runs", () =>
+  Effect.gen(function* () {
+    const group = WsRpcGroup.omit(...[...WsRpcGroup.requests.keys()].filter(
+      (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof WS_METHODS.serverProbe> => tag !== WS_METHODS.serverProbe,
+    ));
+    let handled = false;
+    let stale = false;
+    const current = Effect.suspend(() => stale
+      ? Effect.fail(new EnvironmentAuthorizationError({ message: "Session purpose changed.", requiredScope: AuthOrchestrationReadScope }))
+      : Effect.void);
+    const client = yield* RpcTest.makeClient(group).pipe(Effect.provide(Layer.mergeAll(
+      group.toLayerHandler(WS_METHODS.serverProbe, () => Effect.sync(() => { handled = true; return {}; })),
+      RpcAuthorization.layer([AuthOrchestrationReadScope], null, current),
+    )));
+    expect(yield* client[WS_METHODS.serverProbe]({})).toEqual({});
+    handled = false;
+    stale = true;
+    expect((yield* client[WS_METHODS.serverProbe]({}).pipe(Effect.result))._tag).toBe("Failure");
+    expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+
+it.effect.each([
+  { scopes: [AuthOrchestrationReadScope], purpose: null, allowed: true },
+  { scopes: [AuthOrchestrationReadScope], purpose: "automation" as const, allowed: true },
+  { scopes: [AuthOrchestrationOperateScope], purpose: null, allowed: false },
+])("keeps launch receipt lookup under authenticated read scope: $purpose/$allowed", ({ scopes, purpose, allowed }) =>
+  Effect.gen(function* () {
+    const method = ORCHESTRATION_V2_WS_METHODS.getLaunchReceipt;
+    const group = WsRpcGroup.omit(...[...WsRpcGroup.requests.keys()].filter(
+      (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+    ));
+    let handled = 0;
+    let stale = false;
+    const current = Effect.suspend(() => stale
+      ? Effect.fail(new EnvironmentAuthorizationError({ message: "Session revoked.", requiredScope: AuthOrchestrationReadScope }))
+      : Effect.void);
+    const client = yield* RpcTest.makeClient(group).pipe(Effect.provide(Layer.mergeAll(
+      group.toLayerHandler(method, ({ commandId }) => Effect.sync(() => {
+        handled++;
+        return { type: "no_receipt" as const, commandId };
+      })),
+      RpcAuthorization.layer(scopes, purpose, current),
+    )));
+    const commandId = CommandId.make("launch-read-authority");
+    const first = yield* client[method]({ commandId }).pipe(Effect.result);
+    expect(first._tag).toBe(allowed ? "Success" : "Failure");
+    expect(handled).toBe(allowed ? 1 : 0);
+    stale = true;
+    expect((yield* client[method]({ commandId }).pipe(Effect.result))._tag).toBe("Failure");
+    expect(handled).toBe(allowed ? 1 : 0);
   }).pipe(Effect.scoped),
 );

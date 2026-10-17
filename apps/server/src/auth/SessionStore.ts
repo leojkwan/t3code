@@ -1,5 +1,8 @@
 import {
   AuthSessionId,
+  AuthAccessWriteScope,
+  type AuthClassifyClientSessionInput,
+  type AuthSessionPurpose,
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
   AuthEnvironmentScopes,
@@ -21,6 +24,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
+import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -52,6 +56,8 @@ export interface IssuedSession {
 
 export interface VerifiedSession {
   readonly sessionId: AuthSessionId;
+  /** Re-read from the issuer-owned session row; never inferred from token subject. */
+  readonly purpose?: AuthSessionPurpose | null;
   readonly token: string;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
@@ -61,6 +67,12 @@ export interface VerifiedSession {
   readonly proofKeyThumbprint?: string;
   /** The most an MCP client approved through OAuth may hand to the threads it drives. */
   readonly runtimeModeCeiling?: RuntimeMode;
+}
+
+/** Captured only after authentication; callers cannot put this in a command. */
+export interface SessionAuthorization {
+  readonly sessionId: AuthSessionId;
+  readonly purpose: AuthSessionPurpose | null;
 }
 
 export type SessionCredentialChange =
@@ -373,6 +385,7 @@ export class SessionStore extends Context.Service<
     readonly issue: (input?: {
       readonly ttl?: Duration.Duration;
       readonly subject?: string;
+      readonly purpose?: AuthSessionPurpose;
       readonly method?: ServerAuthSessionMethod;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly client?: AuthClientMetadata;
@@ -409,7 +422,19 @@ export class SessionStore extends Context.Service<
     readonly streamChanges: Stream.Stream<SessionCredentialChange>;
     readonly awaitInvalidation: (
       sessionId: AuthSessionId,
+      expectedPurpose?: AuthSessionPurpose | null,
     ) => Effect.Effect<void, SessionCredentialVerificationError>;
+    readonly assertCurrentAuthorization: (
+      session: SessionAuthorization,
+    ) => Effect.Effect<void, SessionCredentialVerificationError>;
+    readonly withCurrentAuthorization: <A, E, R>(
+      session: SessionAuthorization,
+      use: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | SessionCredentialVerificationError, R>;
+    readonly classify: (
+      administrator: SessionAuthorization,
+      input: AuthClassifyClientSessionInput,
+    ) => Effect.Effect<boolean, SessionCredentialInternalError>;
     readonly revoke: (
       sessionId: AuthSessionId,
     ) => Effect.Effect<boolean, SessionCredentialInternalError>;
@@ -498,6 +523,7 @@ export const make = Effect.gen(function* () {
   const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32);
   const connectedSessionsRef = yield* Ref.make(new Map<AuthSessionId, number>());
   const changesPubSub = yield* PubSub.unbounded<SessionCredentialChange>();
+  const authorizationMutex = yield* Semaphore.make(1);
   const cookieInput = {
     mode: serverConfig.mode,
     port: serverConfig.port,
@@ -562,6 +588,7 @@ export const make = Effect.gen(function* () {
       return Option.some(
         toAuthClientSession({
           sessionId: row.value.sessionId,
+          purpose: row.value.purpose ?? null,
           subject: row.value.subject,
           scopes: row.value.scopes,
           method: row.value.method,
@@ -699,6 +726,7 @@ export const make = Effect.gen(function* () {
       const client = input?.client ?? createDefaultClientMetadata();
       const sessionRecord = {
         sessionId,
+        ...(input?.purpose === undefined ? {} : { purpose: input.purpose }),
         subject: claims.sub,
         scopes: claims.scopes,
         method: claims.method,
@@ -793,6 +821,7 @@ export const make = Effect.gen(function* () {
         }
         return {
           sessionId: row.value.sessionId,
+          purpose: row.value.purpose,
           token,
           method: row.value.method,
           client: toClientMetadata(row.value.client),
@@ -850,6 +879,7 @@ export const make = Effect.gen(function* () {
 
       return {
         sessionId: claims.sid,
+        purpose: row.value.purpose,
         token,
         method: claims.method,
         client: toClientMetadata(row.value.client),
@@ -960,6 +990,7 @@ export const make = Effect.gen(function* () {
 
     return {
       sessionId: row.value.sessionId,
+      purpose: row.value.purpose,
       token,
       method: row.value.method,
       client: toClientMetadata(row.value.client),
@@ -981,6 +1012,7 @@ export const make = Effect.gen(function* () {
       return rows.map((row) =>
         toAuthClientSession({
           sessionId: row.sessionId,
+          purpose: row.purpose ?? null,
           subject: row.subject,
           scopes: row.scopes,
           method: row.method,
@@ -1050,7 +1082,52 @@ export const make = Effect.gen(function* () {
     return revokedSessionIds.length;
   });
 
-  const awaitInvalidation = Effect.fn(function* (sessionId: AuthSessionId) {
+  const readCurrentAuthorization = Effect.fn(function* (session: SessionAuthorization) {
+    const row = yield* authSessions.getById({ sessionId: session.sessionId }).pipe(
+      Effect.mapError((cause) => new SessionCredentialVerificationError({
+        sessionId: session.sessionId, cause,
+      })),
+    );
+    const now = yield* DateTime.now;
+    if (Option.isNone(row) || row.value.revokedAt !== null ||
+      row.value.expiresAt.epochMilliseconds <= now.epochMilliseconds ||
+      (row.value.purpose ?? null) !== session.purpose) {
+      return yield* new SessionCredentialVerificationError({
+        sessionId: session.sessionId, cause: "Session authorization changed; reauthenticate the same session.",
+      });
+    }
+    return row.value;
+  });
+
+  const assertCurrentAuthorization: SessionStore["Service"]["assertCurrentAuthorization"] =
+    (session) => readCurrentAuthorization(session).pipe(Effect.asVoid);
+  const withCurrentAuthorization: SessionStore["Service"]["withCurrentAuthorization"] =
+    (session, use) => authorizationMutex.withPermits(1)(
+      assertCurrentAuthorization(session).pipe(Effect.andThen(use)),
+    );
+  const classify: SessionStore["Service"]["classify"] = (administrator, input) =>
+    authorizationMutex.withPermits(1)(Effect.gen(function* () {
+      const admin = yield* readCurrentAuthorization(administrator);
+      if (admin.purpose === "automation" || !admin.scopes.includes(AuthAccessWriteScope)) {
+        return yield* new SessionCredentialVerificationError({
+          sessionId: administrator.sessionId, cause: "Session classification requires the existing administrative route.",
+        });
+      }
+      const changed = yield* authSessions.classify({ ...input, now: yield* DateTime.now }).pipe(
+        Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId: input.sessionId, cause })),
+      );
+      if (changed) {
+        const session = yield* loadActiveSession(input.sessionId).pipe(
+          Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId: input.sessionId, cause })),
+        );
+        if (Option.isSome(session)) yield* emitUpsert(session.value);
+      }
+      return changed;
+    }));
+
+  const awaitInvalidation = Effect.fn(function* (
+    sessionId: AuthSessionId, expectedPurpose?: AuthSessionPurpose | null,
+  ) {
     return yield* Effect.scoped(
       Effect.gen(function* () {
         // Subscribe before reading: revocation can race with the WebSocket upgrade.
@@ -1062,14 +1139,18 @@ export const make = Effect.gen(function* () {
               (cause) => new SessionCredentialVerificationError({ sessionId, cause }),
             ),
           );
-        if (Option.isNone(row) || row.value.revokedAt !== null) return;
+        if (Option.isNone(row) || row.value.revokedAt !== null ||
+          (expectedPurpose !== undefined && (row.value.purpose ?? null) !== expectedPurpose)) return;
         const now = yield* DateTime.now;
         const remaining = row.value.expiresAt.epochMilliseconds - now.epochMilliseconds;
         if (remaining <= 0) return;
         yield* Effect.raceFirst(
           Stream.fromSubscription(subscription).pipe(
             Stream.filter(
-              (change) => change.type === "clientRemoved" && change.sessionId === sessionId,
+              (change) => change.type === "clientRemoved"
+                ? change.sessionId === sessionId
+                : expectedPurpose !== undefined && change.clientSession.sessionId === sessionId &&
+                  (change.clientSession.purpose ?? null) !== expectedPurpose,
             ),
             Stream.runHead,
           ),
@@ -1088,11 +1169,14 @@ export const make = Effect.gen(function* () {
     verifyWebSocketToken,
     listActive,
     awaitInvalidation,
+    assertCurrentAuthorization,
+    withCurrentAuthorization,
+    classify,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },
-    revoke,
-    revokeAllExcept,
+    revoke: (sessionId) => authorizationMutex.withPermits(1)(revoke(sessionId)),
+    revokeAllExcept: (sessionId) => authorizationMutex.withPermits(1)(revokeAllExcept(sessionId)),
     markConnected,
     markDisconnected,
     recordClientConnection,

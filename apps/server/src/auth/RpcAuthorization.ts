@@ -1,6 +1,17 @@
 import {
   CLIENT_GUARDED_RPC_SCOPES,
   type DeviceListInput,
+  type AuthSessionPurpose,
+  type OrchestrationV2ServerCommand,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2Run,
+  type OrchestrationV2ConversationMessage,
+  type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderFailure,
+  type ScheduledTask,
+  CommandId,
+  MessageId,
+  OrchestrationV2Command,
   clientRpcRequiredScopes,
   authScopeRequiredResponse,
   AssetCreateUrlInput,
@@ -31,11 +42,179 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import type * as RpcGroup from "effect/rpc/RpcGroup";
+import type { SessionAuthorization } from "./SessionStore.ts";
+import type { ProviderAdapterV2NativeGoal } from "@t3tools/provider-core/server/ProviderAdapter";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
+
+/** Carried from verified server auth, never decoded from a command body. */
+export const AuthenticatedSessionPurpose = Context.Reference<AuthSessionPurpose | null | undefined>(
+  "t3/auth/AuthenticatedSessionPurpose",
+  { defaultValue: () => undefined },
+);
+
+export const AuthenticatedSession = Context.Reference<SessionAuthorization | undefined>(
+  "t3/auth/AuthenticatedSession", { defaultValue: () => undefined },
+);
+
+export class OriginalTaskAdmissionRefused extends Schema.TaggedError<OriginalTaskAdmissionRefused>()(
+  "OriginalTaskAdmissionRefused", { reason: Schema.String },
+) {}
+
+export interface OriginalTaskRecoveryTarget {
+  readonly session: SessionAuthorization;
+  readonly operationId: CommandId;
+  readonly thread: OrchestrationV2AppThread;
+  readonly sourceRun: OrchestrationV2Run;
+  readonly originalInput: OrchestrationV2ConversationMessage;
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly failure: OrchestrationV2ProviderFailure;
+  readonly nativeGoal: ProviderAdapterV2NativeGoal;
+}
+
+/** A schedule is authorized through its accepted native creation/enable binding, not a failed input. */
+export interface ScheduledTaskFireTarget {
+  readonly type: "scheduled_fire";
+  readonly task: ScheduledTask;
+  readonly commandId: CommandId;
+  readonly messageId: MessageId;
+  readonly firedAt: string;
+}
+
+/** Set only inside the native admission callback after current SID verification. */
+export const AuthenticatedScheduledTaskFire = Context.Reference<ScheduledTaskFireTarget | undefined>(
+  "t3/auth/AuthenticatedScheduledTaskFire", { defaultValue: () => undefined },
+);
+
+export interface ScheduledTaskRunTarget {
+  readonly type: "scheduled_run";
+  readonly effectId: string;
+  readonly thread: OrchestrationV2AppThread;
+  readonly run: OrchestrationV2Run;
+  readonly originalInput: OrchestrationV2ConversationMessage;
+  readonly providerThread: OrchestrationV2ProviderThread;
+}
+
+export interface ScheduledTaskNativeBinding {
+  /** Issuer-owned and currently verified; never a SID supplied in a task or command. */
+  readonly session: SessionAuthorization;
+  /** Native owner account identity, compared with the backend usage response. */
+  readonly expectedAccountId: string;
+}
+
+export class ScheduledTaskAdmissionRefused extends Schema.TaggedError<ScheduledTaskAdmissionRefused>()(
+  "ScheduledTaskAdmissionRefused", {
+    reason: Schema.Literals(["scheduled_binding_unavailable", "session_authority_unavailable",
+      "task_changed", "run_binding_changed", "owned_join_unavailable"]),
+  },
+) {}
+
+/**
+ * An existing native host supplies this capability, not a command body. It must
+ * bind this verified SID to the actual current Shadow owner/claim and personal
+ * target ancestry, validate the freshly read native goal identity/accounting
+ * against its actual owning goal/hold/Stop/budget, and hold the existing resource admission
+ * through use. Missing or stale authority refuses. No T3 projection, actor,
+ * caller receipt text or client presence is an authority substitute.
+ * It must bind the installed native runtime/protocol to the explicit-null
+ * no-token-cap contract before admitting that mode. Public source or successful
+ * schema decoding alone does not prove the installed association or account limits.
+ *
+ * No installed implementation is assumed. Without the host binding, R2's
+ * refusal fallback remains in force. This is admission, not a controller or a
+ * lifetime lease on a settled launch effect.
+ */
+export class OriginalTaskRecoveryAdmission extends Context.Service<
+  OriginalTaskRecoveryAdmission,
+  { readonly withAdmission: <A, E, R>(
+    target: OriginalTaskRecoveryTarget, use: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | OriginalTaskAdmissionRefused, R>;
+    /**
+     * Optional until the existing native owner implements the accepted task ->
+     * SID/Shadow/personal/resource binding. No production positive is supplied
+     * by T3. Preparation and invalidation I/O must not hold auth/command locks.
+     */
+    readonly withScheduledTaskAdmission?: <A, E, R>(
+      target: ScheduledTaskFireTarget,
+      use: (binding: ScheduledTaskNativeBinding) => Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | ScheduledTaskAdmissionRefused | OriginalTaskAdmissionRefused, R>;
+    /**
+     * Resolve the accepted task and exact outbox/run/attempt again. Keep native
+     * policy invalidation active until use's owned join completes. A failed or
+     * unknown join must not become a resource-release receipt.
+     */
+    readonly withScheduledRunAdmission?: <A, E, R>(
+      target: ScheduledTaskRunTarget,
+      use: (binding: ScheduledTaskNativeBinding) => Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | ScheduledTaskAdmissionRefused | OriginalTaskAdmissionRefused, R>;
+  }
+>()("t3/auth/OriginalTaskRecoveryAdmission") {}
+
+export function originalTaskRecoveryIdentity(
+  threadId: string, request: { readonly sourceRunId: string; readonly originalInputMessageId: string },
+) {
+  const key = [threadId, request.sourceRunId, request.originalInputMessageId]
+    .map(encodeURIComponent).join(":");
+  return { commandId: CommandId.make(`automation-recovery:${key}`),
+    messageId: MessageId.make(`automation-recovery-input:${key}`) };
+}
+
+/** A recovery request carries identities only; new content/options require human intake. */
+export function isOriginalTaskRecoveryRequest(command: OrchestrationV2ServerCommand): boolean {
+  return command.type === "message.dispatch" && command.automationContinuation !== undefined &&
+    command.text === "" && command.attachments.length === 0 && command.context === undefined &&
+    command.dispatchMode.type === "start_immediately" && command.deliveryIntent === undefined &&
+    command.modelSelection === undefined && command.senderThreadId === undefined &&
+    command.scheduledTaskId === undefined && command.sourcePlanRef === undefined &&
+    command.notification === undefined && command.delegatedCompletion === undefined &&
+    command.titleSeed === undefined && command.restartContinuationOfRunId === undefined &&
+    command.usageLimitContinuationOfRunId === undefined && command.manualContinuationOfRunId === undefined &&
+    command.usageLimitRecoveryRequestId === undefined;
+}
+
+const isClientCommand = Schema.is(OrchestrationV2Command);
+
+export const AUTOMATION_AUTHORITY_UNAVAILABLE =
+  "Automated continuation is unavailable: current original-task, Stop, native goal, budget and resource authority are not bound.";
+
+/** Refusal-first until the existing native/Shadow admission bridge is bound. */
+export function automationCommandRefusal(
+  purpose: AuthSessionPurpose | null | undefined,
+  command: OrchestrationV2ServerCommand,
+  hasRecoveryAdmission = false,
+): string | undefined {
+  if (command.type === "message.dispatch" && command.automationContinuation !== undefined) {
+    return purpose === "automation"
+      ? hasRecoveryAdmission && isOriginalTaskRecoveryRequest(command)
+        ? undefined : AUTOMATION_AUTHORITY_UNAVAILABLE
+      : "Automated recovery requires an issuer-classified automation session.";
+  }
+  // Native provider/effect bookkeeping is not client input and must still
+  // settle Stop/cancellation. The WS decoder cannot admit these internal commands.
+  if (purpose !== "automation" || !isClientCommand(command)) return undefined;
+  // Until the real admission bridge exists, only safety commands are permitted.
+  // A model/provider change can restart work too, so default-allow is unsafe.
+  switch (command.type) {
+    case "thread.stop":
+    case "run.interrupt":
+    case "subagent.stop":
+    case "thread.user-input.dismiss":
+      return undefined;
+    case "runtime-request.respond":
+      return (command.decision === "cancel" || command.decision === "decline") &&
+        command.answers === undefined && command.additionalAnswers === undefined &&
+        command.attachmentsByQuestionId === undefined
+        ? undefined
+        : AUTOMATION_AUTHORITY_UNAVAILABLE;
+    default:
+      return AUTOMATION_AUTHORITY_UNAVAILABLE;
+  }
+}
+
 
 /**
  * Keep authorization coverage coupled to the RPC group itself. Adding an RPC to
@@ -56,6 +235,7 @@ export const RPC_REQUIRED_SCOPES = {
   [ORCHESTRATION_V2_WS_METHODS.getThreadProjection]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.getTurnItem]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.launchThread]: AuthOrchestrationOperateScope,
+  [ORCHESTRATION_V2_WS_METHODS.getLaunchReceipt]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeArchivedShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: AuthOrchestrationReadScope,
@@ -276,11 +456,31 @@ const requiredScopesForRpcCall = (
 };
 
 /** Authorizes every RPC on one connection against that connection's session scopes. */
-export const layer = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+export const layer = (
+  scopes: ReadonlyArray<AuthEnvironmentScope>,
+  purpose?: AuthSessionPurpose | null,
+  checkCurrentAuthorization: Effect.Effect<void, EnvironmentAuthorizationError> = Effect.void,
+) =>
   Layer.succeed(RpcScopeAuthorization)((effect, { rpc, payload }) => {
     const requiredScopes = requiredScopesForRpcCall(rpc._tag, payload);
     const requiredScope = requiredScopes.find((scope) => !scopes.includes(scope));
-    return requiredScope === undefined ? effect : Effect.fail(rpcAuthorizationError(requiredScope));
+    if (requiredScope !== undefined) return Effect.fail(rpcAuthorizationError(requiredScope));
+    // Dispatch performs the same refusal under its command lock. Other write
+    // RPCs cannot bypass it through settings, provider or scheduled operations.
+    if (
+      purpose === "automation" &&
+      requiredScopes.some((scope) => !scope.endsWith(":read")) &&
+      rpc._tag !== ORCHESTRATION_V2_WS_METHODS.dispatchCommand &&
+      rpc._tag !== ORCHESTRATION_V2_WS_METHODS.stopWorkflow
+    ) {
+      return Effect.fail(new EnvironmentAuthorizationError({
+        message: AUTOMATION_AUTHORITY_UNAVAILABLE,
+        requiredScope: requiredScopes.find((scope) => !scope.endsWith(":read")) ?? AuthOrchestrationOperateScope,
+      }));
+    }
+    return checkCurrentAuthorization.pipe(
+      Effect.andThen(effect), Effect.provideService(AuthenticatedSessionPurpose, purpose),
+    );
   });
 
 /** Retrying can install or restart tools even though ordinary listing is readable. */

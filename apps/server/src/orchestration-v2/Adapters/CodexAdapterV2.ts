@@ -40,6 +40,7 @@ import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3too
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import type {
   ChatAttachment,
+  MessageId,
   OrchestrationV2AppThread,
   OrchestrationV2ConversationMessage,
   OrchestrationV2ExecutionNode,
@@ -1877,7 +1878,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const deferredRootTerminals = yield* Ref.make(new Map<string, DeferredCodexRootTerminal>());
         const offeredContinuationItemsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         const finalAnswerItemIdsByTurn = yield* Ref.make(new Map<string, Set<string>>());
-        const completedFinalAnswerTextsByTurn = yield* Ref.make(new Map<string, Set<string>>());
+        const completedFinalAnswerTextsByTurn = yield* Ref.make(
+          new Map<
+            string,
+            {
+              readonly texts: ReadonlySet<string>;
+              // Only genuine item/completed final_answer notifications enter
+              // this map. Null means legacy dedup suppressed that item's message.
+              readonly nativeCompletedFinals: ReadonlyMap<string, MessageId | null>;
+            }
+          >(),
+        );
         // Native completion and the interrupt timeout share one finalization
         // path. Serialize the race so only one can publish terminal events.
         const turnTerminalizationPermit = yield* Semaphore.make(1);
@@ -3364,7 +3375,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   update.turnId,
                 );
                 const completedTexts =
-                  (yield* Ref.get(completedFinalAnswerTextsByTurn)).get(update.turnId) ??
+                  (yield* Ref.get(completedFinalAnswerTextsByTurn)).get(update.turnId)?.texts ??
                   new Set<string>();
                 const firstFinalAnswerItemId = finalAnswerItemIds?.values().next().value;
                 const duplicateCompletion =
@@ -3406,9 +3417,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (finalAnswerItem && update.completed) {
                 yield* Ref.update(completedFinalAnswerTextsByTurn, (current) => {
                   const updated = new Map(current);
-                  const texts = new Set(updated.get(update.turnId) ?? []);
+                  const previous = updated.get(update.turnId);
+                  const texts = new Set(previous?.texts ?? []);
                   texts.add(update.text);
-                  updated.set(update.turnId, texts);
+                  updated.set(update.turnId, {
+                    texts,
+                    nativeCompletedFinals: previous?.nativeCompletedFinals ?? new Map(),
+                  });
                   return updated;
                 });
               }
@@ -4960,6 +4975,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
 
+            if (context.providerThread.nativeThreadRef?.nativeId !== payload.threadId) {
+              return;
+            }
+
             if (payload.item.delivery === "async" && payload.item.questions?.length) {
               const artifacts = yield* buildUserInputRequestArtifacts({
                 context,
@@ -5013,7 +5032,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
             }
             const completedTextsBefore =
-              (yield* Ref.get(completedFinalAnswerTextsByTurn)).get(payload.turnId) ??
+              (yield* Ref.get(completedFinalAnswerTextsByTurn)).get(payload.turnId)?.texts ??
               new Set<string>();
             const text = yield* agentMessageDeltas.complete({
               turnId: payload.turnId,
@@ -5039,6 +5058,33 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               !finalAnswer ||
               completedTextsBefore.size === 0 ||
               (text.length > 0 && !completedTextsBefore.has(text));
+            // Rendering also accepts legacy unknown phases and flushTurn can
+            // complete buffered text. Neither certifies a native final result.
+            // Settled background callbacks cannot revise a completed turn.
+            if (!settled && payload.item.phase === "final_answer") {
+              const nativeItemId = payload.item.id;
+              yield* Ref.update(completedFinalAnswerTextsByTurn, (current) => {
+                const updated = new Map(current);
+                const previous = updated.get(payload.turnId);
+                const nativeCompletedFinals = new Map(previous?.nativeCompletedFinals ?? []);
+                if (!nativeCompletedFinals.has(nativeItemId)) {
+                  nativeCompletedFinals.set(
+                    nativeItemId,
+                    emitted
+                      ? idAllocator.derive.messageFromProviderItem({
+                          driver: CODEX_PROVIDER,
+                          nativeItemId,
+                        })
+                      : null,
+                  );
+                }
+                updated.set(payload.turnId, {
+                  texts: previous?.texts ?? new Set(),
+                  nativeCompletedFinals,
+                });
+                return updated;
+              });
+            }
             if (emitted && context.subagent !== null && finalAnswer) {
               yield* emitSubagentTaskUpdate({
                 subagent: context.subagent,
@@ -5782,6 +5828,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 nativeThreadId != null &&
                 (goalsByNativeThread.get(nativeThreadId)?.status === "active" ||
                   (activation !== undefined && !activation.stopped));
+              const nativeCompletedFinals = (
+                yield* Ref.get(completedFinalAnswerTextsByTurn)
+              ).get(input.nativeTurnId)?.nativeCompletedFinals;
+              const terminalAssistantMessageId =
+                input.status === "completed" && nativeCompletedFinals?.size === 1
+                  ? (nativeCompletedFinals.values().next().value ?? null)
+                  : null;
               const completedTurn: OrchestrationV2ProviderTurn = {
                 id: input.context.providerTurnId,
                 providerThreadId: input.context.providerThread.id,
@@ -5797,6 +5850,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 status: input.status,
                 startedAt: input.context.startedAt,
                 completedAt: input.completedAt,
+                terminalAssistantMessageId,
                 turnTokenUsage: completeCodexTurnTokenUsage(
                   usageStateForThread(
                     input.context.providerThread.nativeThreadRef?.nativeId ??
@@ -5975,7 +6029,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         yield* client.handleServerNotification("turn/completed", (payload) =>
           Effect.gen(function* () {
             const context = (yield* Ref.get(activeTurns)).get(payload.turn.id);
-            if (context === undefined) {
+            if (
+              context === undefined ||
+              context.providerThread.nativeThreadRef?.nativeId !== payload.threadId
+            ) {
               return;
             }
             const nativeStatus = mapCodexTurnStatus(payload.turn.status);
@@ -6228,6 +6285,53 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           );
 
+        const readNativeGoalById = (threadId: string) => Effect.gen(function* () {
+          const response = yield* client.request("thread/goal/get", { threadId });
+          if (response.goal != null && response.goal.threadId !== threadId) {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: CODEX_PROVIDER, detail: "Native goal response belongs to a different thread.",
+            });
+          }
+          return response.goal ?? null;
+        });
+        const readNativeGoal: NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["readNativeGoal"]> =
+          (goalInput) => Effect.gen(function* () {
+            const providerThread = goalInput.providerThread;
+            if (providerThread.providerSessionId !== input.providerSessionId ||
+              providerThread.providerInstanceId !== adapterOptions.instanceId ||
+              providerThread.driver !== CODEX_PROVIDER || providerThread.nativeThreadRef?.driver !== CODEX_PROVIDER ||
+              providerThread.nativeThreadRef.strength !== "strong") {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CODEX_PROVIDER, detail: "Native goal read requires this resident session's exact provider thread.",
+              });
+            }
+            const threadId = yield* getNativeThreadId(providerThread);
+            return yield* readNativeGoalById(threadId);
+          }).pipe(Effect.mapError((cause) => new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CODEX_PROVIDER, detail: "Failed to read the resident Codex native goal.", cause,
+          })));
+
+        const readNativeAccount: NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["readNativeAccount"]> =
+          ({ providerThread }) => Effect.gen(function* () {
+            if (providerThread.providerSessionId !== input.providerSessionId ||
+              providerThread.providerInstanceId !== adapterOptions.instanceId ||
+              providerThread.driver !== CODEX_PROVIDER) {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CODEX_PROVIDER, detail: "Native account read requires this resident runtime's provider binding.",
+              });
+            }
+            const account = yield* client.request("account/read", { refreshToken: false });
+            const accountObservedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
+            const rateLimits = yield* client.request("account/rateLimits/read", null);
+            const usageObservedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
+            // Keep backend permission, account identity, all buckets and unknown
+            // values exactly as decoded. A percentage is never permission.
+            return { account: { ...account }, rateLimits: { ...rateLimits },
+              accountObservedAtMs, usageObservedAtMs };
+          }).pipe(Effect.mapError((cause) => new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CODEX_PROVIDER, detail: "Failed to read the resident Codex account and usage.", cause,
+          })));
+
         /**
          * Runs `/goal` through Codex's native goal API, as the Codex TUI does.
          * Setting or resuming a goal starts the first goal turn with this run's
@@ -6243,13 +6347,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
             // Goal notifications during the command belong to this run's snapshot.
             rootProviderThreads.set(threadId, turnInput.providerThread);
-            const readGoal = client
-              .request("thread/goal/get", { threadId })
-              .pipe(
-                Effect.map((response) =>
-                  response.goal == null ? null : providerGoalFromCodex(response.goal),
-                ),
-              );
+            const readGoal = readNativeGoalById(threadId).pipe(
+              Effect.map((goal) => goal === null ? null : providerGoalFromCodex(goal)),
+            );
             const current = yield* readGoal;
             goalsByNativeThread.set(threadId, current);
             if (command.type === "show") {
@@ -7160,6 +7260,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
             ),
           mcpApps,
+          readNativeGoal,
+          readNativeAccount,
           readThreadSnapshot: (threadInput) =>
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(threadInput.providerThread);

@@ -67,6 +67,18 @@ export function threadRuntimeIsActive(runtime: ThreadRuntimeSummary | null | und
   return runtime !== null && runtime !== undefined && threadRunStatusIsActive(runtime.status);
 }
 
+/** Optional async questions remain answerable while the agent keeps working. */
+export function threadHasBlockingUserInput(
+  thread: Pick<EnvironmentThreadShell, "hasPendingUserInput" | "pendingUserInputIsBlocking" | "runtime">,
+): boolean {
+  return (
+    thread.hasPendingUserInput &&
+    (thread.pendingUserInputIsBlocking !== false ||
+      thread.runtime == null ||
+      !["preparing", "starting", "running", "waiting"].includes(thread.runtime.status))
+  );
+}
+
 /** Archiving may discard queued work, but it must not detach a provider that
  * is preparing, starting, or running a turn. */
 export function threadRuntimeCanArchive(runtime: ThreadRuntimeSummary | null | undefined): boolean {
@@ -109,6 +121,8 @@ export interface EnvironmentThreadShell {
   readonly latestUserAuthoredMessageAt?: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+  /** Older server summaries keep questions blocking until capability is known. */
+  readonly pendingUserInputIsBlocking?: boolean;
   readonly hasActionableProposedPlan: boolean;
   readonly pendingBackgroundTasks: ReadonlyArray<
     NonNullable<OrchestrationV2ThreadShell["pendingBackgroundTasks"]>[number]
@@ -259,6 +273,7 @@ export function presentThreadShell(
       thread.pendingRuntimeRequest.kind !== "user_input" &&
       thread.pendingRuntimeRequest.kind !== "auth_refresh",
     hasPendingUserInput: thread.pendingRuntimeRequest?.kind === "user_input",
+    pendingUserInputIsBlocking: thread.pendingRuntimeRequest?.responseCapability?.type !== "message",
     hasActionableProposedPlan: thread.hasActionableProposedPlan,
     pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [],
     providerInstanceHistory: thread.providerInstanceHistory ?? [],

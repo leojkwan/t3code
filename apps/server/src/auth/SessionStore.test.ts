@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
+import { AuthAdministrativeScopes, AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -101,6 +101,7 @@ const layerFailingSessionLookupRepository = Layer.succeed(AuthSessions.AuthSessi
   revokeAllExcept: () => Effect.fail(repositoryFailure),
   setLastConnectedAt: () => Effect.void,
   setClientConnection: () => Effect.void,
+  classify: () => Effect.fail(repositoryFailure),
 });
 
 const layerFailingSessionLookupCredential = Layer.effect(
@@ -115,6 +116,108 @@ const layerFailingSessionLookupCredential = Layer.effect(
 );
 
 it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
+  it.effect("classifies only the existing SID, invalidates captured purpose and preserves signed-subject human siblings across restart", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const base = yield* fs.makeTempDirectoryScoped({ prefix: "t3-purpose-classification-" });
+      const firstLayer = yield* makeDiskSessionStoreLayer(base);
+      const issued = yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const admin = yield* sessions.issue({ purpose: "human", scopes: AuthAdministrativeScopes });
+        // --subject is freely supplied to the ordinary issuer. It cannot prove automation.
+        const target = yield* sessions.issue({ subject: "hermes-gateway", method: "bearer-access-token" });
+        const sibling = yield* sessions.issue({ subject: "hermes-gateway", method: "bearer-access-token", purpose: "human" });
+        const captured = { sessionId: target.sessionId, purpose: null } as const;
+        const administrator = { sessionId: admin.sessionId, purpose: "human" } as const;
+        const before = yield* sessions.verify(target.token);
+        const ticket = yield* sessions.issueWebSocketToken(target.sessionId);
+        const invalidation = yield* sessions.awaitInvalidation(target.sessionId, null)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        expect(yield* sessions.classify(administrator, {
+          sessionId: target.sessionId, expectedPurpose: "human", purpose: "automation",
+        })).toBe(false);
+        expect(yield* sessions.classify(administrator, {
+          sessionId: target.sessionId, expectedPurpose: null, purpose: "automation",
+        })).toBe(true);
+        yield* Fiber.join(invalidation);
+        let staleUse = false;
+        expect((yield* sessions.withCurrentAuthorization(captured,
+          Effect.sync(() => { staleUse = true; })).pipe(Effect.result))._tag).toBe("Failure");
+        expect(staleUse).toBe(false);
+        const after = yield* sessions.verify(target.token);
+        expect(after).toEqual({ ...before, purpose: "automation" });
+        expect((yield* sessions.verifyWebSocketToken(ticket.token)).purpose).toBe("automation");
+        expect((yield* sessions.verify(sibling.token)).purpose).toBe("human");
+        expect(yield* sessions.classify(administrator, {
+          sessionId: target.sessionId, expectedPurpose: null, purpose: "automation",
+        })).toBe(false);
+        expect((yield* sessions.classify({ sessionId: target.sessionId, purpose: "automation" }, {
+          sessionId: sibling.sessionId, expectedPurpose: "human", purpose: "automation",
+        }).pipe(Effect.result))._tag).toBe("Failure");
+        return { target, sibling };
+      }).pipe(Effect.provide(firstLayer), Effect.scoped);
+      const restarted = yield* makeDiskSessionStoreLayer(base);
+      yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        expect((yield* sessions.verify(issued.target.token)).purpose).toBe("automation");
+        expect((yield* sessions.verify(issued.sibling.token)).purpose).toBe("human");
+      }).pipe(Effect.provide(restarted), Effect.scoped);
+    }),
+  );
+
+  it.effect("serializes same-SID classification behind current authorization use and rejects a revoked captured session", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const admin = yield* sessions.issue({ purpose: "human", scopes: AuthAdministrativeScopes });
+      const target = yield* sessions.issue();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const use = yield* sessions.withCurrentAuthorization({ sessionId: target.sessionId, purpose: null },
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(entered);
+      const classification = yield* sessions.classify({ sessionId: admin.sessionId, purpose: "human" }, {
+        sessionId: target.sessionId, expectedPurpose: null, purpose: "automation",
+      }).pipe(Effect.forkChild({ startImmediately: true }));
+      expect((yield* sessions.verify(target.token)).purpose).toBeNull();
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(use);
+      expect(yield* Fiber.join(classification)).toBe(true);
+      yield* sessions.revoke(target.sessionId);
+      expect((yield* sessions.assertCurrentAuthorization({ sessionId: target.sessionId, purpose: "automation" })
+        .pipe(Effect.result))._tag).toBe("Failure");
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+  it.effect("persists issuer purpose across verification, tickets and a disk-backed restart without inferring client labels", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const base = yield* fs.makeTempDirectoryScoped({ prefix: "t3-purpose-" });
+      const firstLayer = yield* makeDiskSessionStoreLayer(base);
+      const issued = yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const automation = yield* sessions.issue({ subject: "cli-issued-session", method: "bearer-access-token", purpose: "automation" });
+        const legacy = yield* sessions.issue({ subject: "cli-issued-session", method: "bearer-access-token", client: { deviceType: "bot", label: "automation" } });
+        const human = yield* sessions.issue({ subject: "same-subject", method: "bearer-access-token", purpose: "human" });
+        expect((yield* sessions.verify(automation.token)).purpose).toBe("automation");
+        expect((yield* sessions.verify(legacy.token)).purpose).toBeNull();
+        expect((yield* sessions.verify(human.token)).purpose).toBe("human");
+        const ticket = yield* sessions.issueWebSocketToken(automation.sessionId);
+        expect((yield* sessions.verifyWebSocketToken(ticket.token)).purpose).toBe("automation");
+        return { automation, legacy, human, ticket };
+      }).pipe(Effect.provide(firstLayer), Effect.scoped);
+      const restartedLayer = yield* makeDiskSessionStoreLayer(base);
+      yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        expect((yield* sessions.verify(issued.automation.token)).purpose).toBe("automation");
+        expect((yield* sessions.verifyWebSocketToken(issued.ticket.token)).purpose).toBe("automation");
+        expect((yield* sessions.verify(issued.legacy.token)).purpose).toBeNull();
+        yield* sessions.revoke(issued.automation.sessionId);
+        expect((yield* sessions.verify(issued.automation.token).pipe(Effect.flip))._tag).toBe("SessionTokenRevokedError");
+        expect((yield* sessions.verify(issued.human.token)).purpose).toBe("human");
+      }).pipe(Effect.provide(restartedLayer), Effect.scoped);
+    }),
+  );
+
   it.effect.each(["revoke", "revokeAllExcept", "replace"] as const)(
     "invalidates every connection for a session on %s and leaves other sessions active",
     (operation) =>

@@ -31,6 +31,7 @@ import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -4327,6 +4328,10 @@ function runBackgroundItemScenario(
   makeEvents: (ids: BackgroundScenarioIds) => ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>,
   options?: {
     readonly keepEventStreamOpen?: boolean;
+    readonly eventStream?: (ids: BackgroundScenarioIds) => Stream.Stream<ProviderAdapter.ProviderAdapterV2Event>;
+    readonly onStarted?: (owned: RunExecutionService.RunExecutionOwnedLifetime | void) =>
+      Effect.Effect<void, RunExecutionService.RunExecutionServiceV2Error>;
+    readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
     readonly loadInheritedBackgroundTurnItems?: () => Effect.Effect<
       ReadonlyArray<{ readonly id: TurnItemId; readonly runId: RunId }>
     >;
@@ -4385,7 +4390,7 @@ function runBackgroundItemScenario(
 
     yield* Effect.gen(function* () {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
-      yield* runExecution.startRootRun({
+      const owned = yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${key}`),
         appThread: { id: ids.threadId } as OrchestrationV2AppThread,
         providerSessionId: ProviderSessionId.make(`session:${key}`),
@@ -4393,7 +4398,7 @@ function runBackgroundItemScenario(
           events: Stream.empty,
           subscribeEvents: Effect.gen(function* () {
             yield* options?.onSubscribe ?? Effect.void;
-            const events = Stream.fromIterable(makeEvents(ids));
+            const events = options?.eventStream?.(ids) ?? Stream.fromIterable(makeEvents(ids));
             return {
               events:
                 options?.keepEventStreamOpen === true
@@ -4403,6 +4408,7 @@ function runBackgroundItemScenario(
             };
           }),
           startTurn: () => Effect.void,
+          interruptTurn: options?.interruptTurn ?? (() => Effect.die("unexpected native interruption")),
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {
           id: ids.runId,
@@ -4449,6 +4455,7 @@ function runBackgroundItemScenario(
           },
         },
       });
+      yield* options?.onStarted?.(owned) ?? Effect.void;
     }).pipe(Effect.provide(layerTest));
 
     const closed = yield* Deferred.await(ingestionDone).pipe(Effect.timeoutOption("2 seconds"));
@@ -4456,6 +4463,54 @@ function runBackgroundItemScenario(
     return yield* Ref.get(observed);
   });
 }
+
+it.effect("returns startup before owned stream join and awaits the original native finalizer before that join", () =>
+  Effect.gen(function* () {
+    const rootSeen = yield* Deferred.make<void>();
+    const streamRelease = yield* Deferred.make<void>();
+    const nativeEntered = yield* Deferred.make<void>();
+    const nativeRelease = yield* Deferred.make<void>();
+    const trace: string[] = [];
+    yield* runBackgroundItemScenario("scheduled-owned-lifetime", () => [], {
+      eventStream: (ids) => Stream.fromIterable([
+        backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+        rootTerminalEvent(ids, "completed"),
+      ]).pipe(Stream.concat(Stream.fromEffect(
+        Deferred.succeed(rootSeen, undefined).pipe(Effect.andThen(Deferred.await(streamRelease)),
+          Effect.as(backgroundTurnItemEvent(ids, "command_execution", "completed", 2))),
+      ))),
+      interruptTurn: (input) => Effect.gen(function* () {
+        const ids = backgroundScenarioIds("scheduled-owned-lifetime");
+        assert.equal(input.providerThread.id, ids.providerThreadId);
+        assert.equal(input.providerTurnId, ids.rootProviderTurnId);
+        trace.push("exact-native-interrupt");
+        yield* Deferred.succeed(nativeEntered, undefined);
+        yield* Deferred.await(nativeRelease);
+        trace.push("native-finalizer-joined");
+        yield* Deferred.succeed(streamRelease, undefined);
+      }),
+      onStarted: (owned) => Effect.gen(function* () {
+        assert.isDefined(owned);
+        if (owned === undefined) return yield* Effect.die("missing owned lifetime");
+        trace.push("startup-returned");
+        yield* Deferred.await(rootSeen);
+        const joined = yield* owned.awaitOwnedJoin.pipe(
+          Effect.tap(() => Effect.sync(() => { trace.push("owned-stream-joined"); })), Effect.forkChild,
+        );
+        assert.isFalse(trace.includes("owned-stream-joined"));
+        const interrupted = yield* owned.interruptAndAwaitOwnedJoin.pipe(Effect.forkChild);
+        yield* Deferred.await(nativeEntered);
+        assert.isFalse(trace.includes("owned-stream-joined"));
+        assert.isFalse(yield* Deferred.isDone(streamRelease));
+        yield* Deferred.succeed(nativeRelease, undefined);
+        yield* Fiber.join(interrupted);
+        yield* Fiber.join(joined);
+        yield* owned.interruptAndAwaitOwnedJoin;
+      }),
+    });
+    assert.deepEqual(trace, ["startup-returned", "exact-native-interrupt", "native-finalizer-joined", "owned-stream-joined"]);
+  }),
+);
 
 it.effect("releases ingestion after idle subagent rows and items settle", () =>
   Effect.gen(function* () {

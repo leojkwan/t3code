@@ -68,6 +68,7 @@ import {
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -117,6 +118,17 @@ import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import {
+  AuthenticatedSessionPurpose,
+  AuthenticatedSession,
+  AuthenticatedScheduledTaskFire,
+  ScheduledTaskAdmissionRefused,
+  OriginalTaskRecoveryAdmission,
+  originalTaskRecoveryIdentity,
+  automationCommandRefusal,
+} from "../auth/RpcAuthorization.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
+import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import {
   endOrphanedNativeSubagent,
   endRunlessRootTurns,
@@ -838,6 +850,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const configuredNativeGoalControl = yield* Effect.serviceOption(ProviderTurnControlService.ProviderTurnControlServiceV2);
 
   const mapDispatchError =
     (command: OrchestrationV2ServerCommand) =>
@@ -5087,6 +5100,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
         };
         const message: OrchestrationV2ConversationMessage = {
+        ...(command.automationContinuation === undefined ? {} : { automationContinuation: command.automationContinuation }),
           createdBy: command.createdBy,
           creationSource: command.creationSource,
           ...(command.scheduledTaskId === undefined
@@ -5431,6 +5445,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: null,
         };
         const message: OrchestrationV2ConversationMessage = {
+        ...(command.automationContinuation === undefined ? {} : { automationContinuation: command.automationContinuation }),
           createdBy: command.createdBy,
           creationSource: command.creationSource,
           ...(command.scheduledTaskId === undefined
@@ -6125,6 +6140,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         completedAt: null,
       };
       const message: OrchestrationV2ConversationMessage = {
+        ...(command.automationContinuation === undefined ? {} : { automationContinuation: command.automationContinuation }),
         createdBy: command.createdBy,
         creationSource: command.creationSource,
         ...(command.scheduledTaskId === undefined
@@ -7296,7 +7312,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
-  const dispatchRuntimeRequestRespond = (
+  const resolveRuntimeRequestResponse = (
     command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.respond" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
@@ -7339,6 +7355,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandId: command.commandId,
           commandType: command.type,
           cause: `Provider session ${providerSessionId} was not found.`,
+        });
+      }
+
+      if (
+        runtimeRequest.responseCapability.type === "message" &&
+        command.decision !== "cancel" &&
+        command.decision !== "decline" &&
+        context.node?.runId != null &&
+        (yield* stopReachedRun(command, command.threadId, context.node.runId))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "This question belongs to a stopped run. Dismiss it or explicitly resume the thread.",
         });
       }
 
@@ -7457,55 +7487,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: "Enter an answer before sending.",
           });
         }
-        let dispatchMode: Extract<
-          OrchestrationV2Command,
-          { type: "message.dispatch" }
-        >["dispatchMode"] = {
-          type: "queue_after_active",
-        };
-        const {
-          run: activeRun,
-          providerThread: activeProviderThread,
-          providerTurn: activeProviderTurn,
-        } = yield* projectionStore
-          .getRunningTurnContext(command.threadId)
-          .pipe(mapDispatchError(command));
-        if (activeRun && activeProviderTurn && activeProviderThread?.providerSessionId) {
-          const activeSession = yield* providerSessions
-            .get(activeProviderThread.providerSessionId)
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestratorDispatchError({
-                    commandId: command.commandId,
-                    commandType: command.type,
-                    cause,
-                  }),
-              ),
-            );
-          if (
-            Option.isSome(activeSession) &&
-            activeSession.value.providerSession.capabilities.turns.supportsActiveSteering
-          ) {
-            dispatchMode = { type: "steer_active", targetRunId: activeRun.id };
-          }
-        }
-        // The resolution and normal message dispatch share one event transaction.
-        return yield* dispatchMessage(
-          {
-            type: "message.dispatch",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            messageId: MessageId.make(`async-answer:${command.requestId}`),
-            text: replies.join("\n\n"),
-            attachments: [],
-            createdBy: "user",
-            creationSource: "server",
-            dispatchMode,
-          },
-          events,
-          effects,
-        );
+        return replies.join("\n\n");
       }
       if (providerSessionId === null) return;
       yield* Ref.update(effects, (existing) => [
@@ -7523,6 +7505,102 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         } satisfies PendingOrchestrationEffectV2,
       ]);
+    });
+
+  const dispatchRuntimeRequestRespond = (
+    command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.respond" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) =>
+    Effect.gen(function* () {
+      const { additionalAnswers, ...primary } = command;
+      const responses = [
+        primary,
+        ...(additionalAnswers ?? []).map((answer) => ({
+          ...primary,
+          requestId: answer.requestId,
+          answers: answer.answers,
+          attachmentsByQuestionId: undefined,
+        })),
+      ];
+      if (additionalAnswers !== undefined) {
+        const requestIds = new Set(responses.map((response) => response.requestId));
+        if (requestIds.size !== responses.length || command.decision !== undefined) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Batch answers require distinct async questions and cannot contain approval decisions.",
+          });
+        }
+        for (const response of responses) {
+          const request = yield* projectionStore
+            .getRuntimeRequest(command.threadId, response.requestId)
+            .pipe(mapDispatchError(command));
+          if (request?.kind !== "user_input" || request.responseCapability.type !== "message") {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Batch answers must belong to pending async questions in this thread.",
+            });
+          }
+        }
+      }
+      const replies: string[] = [];
+      for (const response of responses) {
+        const reply = yield* resolveRuntimeRequestResponse(response, events, effects);
+        if (reply !== undefined) replies.push(reply);
+      }
+      if (replies.length === 0) return;
+      const text = replies.join("\n\n");
+      let dispatchMode: Extract<
+        OrchestrationV2Command,
+        { type: "message.dispatch" }
+      >["dispatchMode"] = {
+        type: "queue_after_active",
+      };
+      const {
+        run: activeRun,
+        providerThread: activeProviderThread,
+        providerTurn: activeProviderTurn,
+      } = yield* projectionStore
+        .getRunningTurnContext(command.threadId)
+        .pipe(mapDispatchError(command));
+      if (activeRun && activeProviderTurn && activeProviderThread?.providerSessionId) {
+        const activeSession = yield* providerSessions
+          .get(activeProviderThread.providerSessionId)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause,
+                }),
+            ),
+          );
+        if (
+          Option.isSome(activeSession) &&
+          activeSession.value.providerSession.capabilities.turns.supportsActiveSteering
+        ) {
+          dispatchMode = { type: "steer_active", targetRunId: activeRun.id };
+        }
+      }
+      // The resolution and normal message dispatch share one event transaction.
+      return yield* dispatchMessage(
+        {
+          type: "message.dispatch",
+          commandId: command.commandId,
+          threadId: command.threadId,
+          messageId: MessageId.make(`async-answer:${command.requestId}`),
+          text,
+          attachments: [],
+          createdBy: command.createdBy ?? "user",
+          creationSource: command.creationSource ?? "server",
+          dispatchMode,
+        },
+        events,
+        effects,
+      );
     });
 
   const dispatchThreadUserInputDismiss = (
@@ -10886,8 +10964,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     };
   });
 
-  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
+  const dispatchWithReceiptBody = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
     command: OrchestrationV2ServerCommand,
+    expectedThreadVersions?: ReadonlyArray<{ readonly threadId: ThreadId; readonly sequence: number }>,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -11055,6 +11134,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         acceptedAt,
         events: plan.events,
         effects: plan.effects,
+        ...(expectedThreadVersions === undefined ? {} : { expectedThreadVersions }),
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
@@ -11093,31 +11173,282 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     } satisfies OrchestratorV2DispatchResult;
   });
 
-  const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
-    Effect.gen(function* () {
-      const dispatch = threadDispatch.withLock(
-        commandThreadId(command),
-        dispatchWithReceiptEffect(command),
-      );
-      if (
-        command.type !== "message.dispatch" ||
-        (command.createdBy !== "user" && command.creationSource !== "mcp")
-      )
-        return yield* dispatch;
-      const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(
-        Effect.mapError(
-          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-        ),
-      );
-      // Follow-up intake and Stop serialize on the parent before taking the child lock.
-      return yield* parentThreadId === undefined
-        ? dispatch
-        : threadDispatch.withLock(parentThreadId, dispatch);
+  const withCommandLocks = <A, E, R>(
+    command: OrchestrationV2ServerCommand, effect: Effect.Effect<A, E, R>,
+  ) => Effect.gen(function* () {
+    const dispatch = threadDispatch.withLock(commandThreadId(command), effect);
+    if (command.type !== "message.dispatch" ||
+      (command.automationContinuation === undefined && command.createdBy !== "user" && command.creationSource !== "mcp")) {
+      return yield* dispatch;
+    }
+    const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(
+      Effect.mapError((cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause })),
+    );
+    // Immutable app-owned lineage keeps the existing parent-before-child order.
+    return yield* parentThreadId === undefined ? dispatch : threadDispatch.withLock(parentThreadId, dispatch);
+  });
+
+  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.admission")(function* (
+    command: OrchestrationV2ServerCommand,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    const purpose = yield* AuthenticatedSessionPurpose;
+    const session = yield* AuthenticatedSession;
+    const scheduledFire = yield* AuthenticatedScheduledTaskFire;
+    const refuse = (cause: unknown) => new OrchestratorDispatchError({
+      commandId: command.commandId, commandType: command.type, cause,
     });
+    const scheduledMessage = command.type === "message.dispatch" && command.scheduledTaskId !== undefined;
+    const scheduledCreate = scheduledFire !== undefined && command.type === "thread.create";
+    let boundScheduledCommand = false;
+    if (scheduledMessage || scheduledCreate) {
+      if (scheduledFire === undefined || session === undefined) return yield* refuse(
+        new ScheduledTaskAdmissionRefused({ reason: "scheduled_binding_unavailable" }),
+      );
+      const task = scheduledFire.task;
+      if (command.type === "message.dispatch" && (isGoalCommand(command) || isNativeMaintenanceCommand(command)))
+        return yield* refuse("Scheduled work cannot supply fresh human native control authority.");
+      boundScheduledCommand = command.type === "thread.create"
+        ? command.commandId === scheduledFire.commandId && command.projectId === task.projectId &&
+          modelSelectionsEqual(command.modelSelection, task.modelSelection) &&
+          command.runtimeMode === task.runtimeMode && command.interactionMode === task.interactionMode
+        : command.type === "message.dispatch" && command.scheduledTaskId === task.id &&
+          (command.commandId === scheduledFire.commandId || command.commandId === `${scheduledFire.commandId}:initial-message`) &&
+          command.messageId === scheduledFire.messageId && command.text === task.prompt && command.attachments.length === 0 &&
+          (task.threadId === null || command.threadId === task.threadId) &&
+          (command.modelSelection === undefined || modelSelectionsEqual(command.modelSelection, task.modelSelection));
+      if (!boundScheduledCommand) return yield* refuse(
+        new ScheduledTaskAdmissionRefused({ reason: "task_changed" }),
+      );
+    }
+    const refusal = boundScheduledCommand ? undefined : automationCommandRefusal(purpose, command);
+    if (refusal !== undefined) return yield* refuse(refusal);
+    const sessions = yield* Effect.serviceOption(SessionStore.SessionStore);
+    if (session !== undefined && (Option.isNone(sessions) || session.purpose !== purpose)) {
+      return yield* refuse("Verified session authority is unavailable or stale.");
+    }
+    return yield* session !== undefined && Option.isSome(sessions)
+      ? sessions.value.withCurrentAuthorization(session, dispatchWithReceiptBody(command)).pipe(mapDispatchError(command))
+      : dispatchWithReceiptBody(command);
+  });
+
+  const dispatchOriginalTaskRecovery = Effect.fn("orchestrationV2.dispatch.recoveryPreparation")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    const purpose = yield* AuthenticatedSessionPurpose;
+    const session = yield* AuthenticatedSession;
+    const admission = yield* Effect.serviceOption(OriginalTaskRecoveryAdmission);
+    const sessions = yield* Effect.serviceOption(SessionStore.SessionStore);
+    const refuse = (cause: unknown) => new OrchestratorDispatchError({
+      commandId: command.commandId, commandType: command.type, cause,
+    });
+    const refusal = automationCommandRefusal(purpose, command, Option.isSome(admission));
+    if (refusal !== undefined) return yield* refuse(refusal);
+    if (session === undefined || session.purpose !== "automation" || purpose !== session.purpose ||
+      Option.isNone(admission) || Option.isNone(sessions) || command.automationContinuation === undefined) {
+      return yield* refuse("Original-task recovery requires verified SID and native admission.");
+    }
+    const currentControl = yield* Effect.serviceOption(ProviderTurnControlService.ProviderTurnControlServiceV2);
+    const control = Option.isSome(currentControl) ? currentControl : configuredNativeGoalControl;
+    if (Option.isNone(control)) return yield* refuse("Native goal control is unavailable.");
+    const request = command.automationContinuation;
+    const identity = originalTaskRecoveryIdentity(command.threadId, request);
+    if (command.commandId !== identity.commandId || command.messageId !== identity.messageId) {
+      return yield* refuse("Recovery identity must bind the original thread, run and input exactly.");
+    }
+    const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) => withCommandLocks(command,
+      sessions.value.withCurrentAuthorization(session, effect).pipe(mapDispatchError(command)),
+    );
+    // Only durable reads/replay and final commit use canonical/auth locks. No
+    // native RPC or host admission is awaited in either critical section.
+    const snapshot = yield* locked(Effect.gen(function* () {
+      // Provider events can commit without the command lock. Capture versions
+      // before eligibility, then reject drift rather than pair old data with a
+      // newer sequence that would hide the intervening event from cancellation.
+      const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(mapDispatchError(command));
+      const version = yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(mapDispatchError(command));
+      const parentVersion = parentThreadId === undefined ? undefined :
+        yield* eventSink.latestSequence({ threadId: parentThreadId }).pipe(mapDispatchError(command));
+      const projection = yield* readCommandProjection(command.threadId).pipe(mapDispatchError(command));
+      const receipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(mapDispatchError(command));
+      if (Option.isSome(receipt)) {
+        const delivered = projection.messages.find((message) => message.id === identity.messageId);
+        if (receipt.value.status !== "accepted" || receipt.value.threadId !== command.threadId ||
+          delivered?.createdBy !== "agent" || delivered.creationSource !== "server" ||
+          delivered.automationContinuation?.sourceRunId !== request.sourceRunId ||
+          delivered.automationContinuation.originalInputMessageId !== request.originalInputMessageId) {
+          return yield* refuse("The existing receipt is not this original-input recovery.");
+        }
+        return { type: "replayed" as const, result: yield* dispatchWithReceiptBody(command) };
+      }
+      const sourceRun = projection.runs.find((run) => run.id === request.sourceRunId);
+      const originalInput = projection.messages.find((message) => message.id === request.originalInputMessageId);
+      const providerThread = projection.providerThreads.find((thread) => thread.id === sourceRun?.providerThreadId);
+      const failure = latestRootProviderFailure(sourceRun ?? null, projection.turnItems);
+      if (sourceRun === undefined || sourceRun.status !== "failed" ||
+        sourceRun.queueHeld === true ||
+        latestExecutedRun(projection.runs)?.id !== sourceRun.id ||
+        sourceRun.userMessageId !== request.originalInputMessageId ||
+        originalInput === undefined || originalInput.threadId !== command.threadId || originalInput.role !== "user" ||
+        isGoalCommand(originalInput) || isNativeMaintenanceCommand(originalInput) ||
+        providerThread === undefined || providerThread.appThreadId !== command.threadId ||
+        providerThread.providerInstanceId !== sourceRun.providerInstanceId ||
+        projection.thread.providerInstanceId !== sourceRun.providerInstanceId ||
+        failure === null || failure.retryable !== true ||
+        (failure.class !== "transport_error" && failure.class !== "provider_error") ||
+        projection.thread.archivedAt !== null || projection.thread.deletedAt !== null ||
+        projection.thread.settledAt !== null || projection.thread.settledOverride !== null ||
+        projection.thread.snoozedUntil != null || projection.runs.some(isBlockingRun) ||
+        projection.runs.some((run) => run.status === "queued") ||
+        projection.runtimeRequests.some((runtimeRequest) => runtimeRequest.status === "pending") ||
+        (yield* stopReachedRun(command, command.threadId, sourceRun.id))) {
+        return yield* refuse("Original input is not an eligible failed, unstopped task on the current idle thread.");
+      }
+      if (providerThread.providerSessionId === null) return yield* refuse("Original resident runtime is unavailable.");
+      const afterVersion = yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(mapDispatchError(command));
+      const afterParentVersion = parentThreadId === undefined ? undefined :
+        yield* eventSink.latestSequence({ threadId: parentThreadId }).pipe(mapDispatchError(command));
+      if (afterVersion !== version || afterParentVersion !== parentVersion) {
+        return yield* refuse("Recovery eligibility changed while its initial snapshot was read.");
+      }
+      return { type: "prepared" as const, projection, sourceRun, originalInput, providerThread, failure,
+        version, parentThreadId, parentVersion, providerSessionId: providerThread.providerSessionId };
+    }));
+    if (snapshot.type === "replayed") return snapshot.result;
+    const { sourceRun, originalInput, providerThread, failure } = snapshot;
+    const recovered: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }> = {
+      type: "message.dispatch", ...identity, threadId: command.threadId,
+      automationContinuation: request, text: originalInput.text,
+      attachments: originalInput.attachments,
+      ...(originalInput.context === undefined ? {} : { context: originalInput.context }),
+      modelSelection: sourceRun.modelSelection, createdBy: "agent", creationSource: "server",
+      dispatchMode: { type: "start_immediately" },
+    };
+    const nativeGoalInput = { threadId: command.threadId, sourceRunId: sourceRun.id,
+      providerThreadId: providerThread.id, providerSessionId: snapshot.providerSessionId };
+    const committing = yield* Deferred.make<void>();
+    const changed = eventSink.stream({ threadId: command.threadId, afterSequence: snapshot.version });
+    const changes = snapshot.parentThreadId === undefined ? changed : Stream.merge(changed,
+      eventSink.stream({ threadId: snapshot.parentThreadId, afterSequence: snapshot.parentVersion! }));
+    // The existing replay+live event stream closes the subscribe/read race. A
+    // version change cancels preparation, never retries it or creates another run.
+    const policyChanged = Effect.raceFirst(
+      changes.pipe(Stream.runHead, Effect.as(true)), Deferred.await(committing).pipe(Effect.as(false)),
+    ).pipe(mapDispatchError(command), Effect.flatMap((stale) => Effect.gen(function* () {
+      if (!stale || (yield* Deferred.isDone(committing))) return yield* Effect.never;
+      return yield* refuse("Original task or parent changed during recovery preparation.");
+    })));
+    const authorizationChanged = Effect.raceFirst(
+      sessions.value.awaitInvalidation(session.sessionId, session.purpose).pipe(Effect.as(true)),
+      Deferred.await(committing).pipe(Effect.as(false)),
+    ).pipe(mapDispatchError(command), Effect.flatMap((stale) => Effect.gen(function* () {
+      if (!stale || (yield* Deferred.isDone(committing))) return yield* Effect.never;
+      return yield* refuse("Session authorization changed during recovery preparation.");
+    })));
+    const preparation = Effect.gen(function* () {
+      const nativeGoal = yield* control.value.readNativeGoal(nativeGoalInput).pipe(mapDispatchError(command));
+      const use = Effect.gen(function* () {
+        // This final read still occurs outside both locks. It is an observation,
+        // not a freeze of native state; native execution must enforce its budget.
+        const finalGoal = yield* control.value.readNativeGoal(nativeGoalInput).pipe(mapDispatchError(command));
+        if (finalGoal.threadId !== nativeGoal.threadId || finalGoal.createdAt !== nativeGoal.createdAt ||
+          finalGoal.objective !== nativeGoal.objective) return yield* refuse("Native goal identity changed during admission.");
+        return yield* locked(Effect.gen(function* () {
+          const version = yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(mapDispatchError(command));
+          const parentVersion = snapshot.parentThreadId === undefined ? undefined :
+            yield* eventSink.latestSequence({ threadId: snapshot.parentThreadId }).pipe(mapDispatchError(command));
+          if (version !== snapshot.version || parentVersion !== snapshot.parentVersion ||
+            (yield* stopReachedRun(command, command.threadId, sourceRun.id))) {
+            return yield* refuse("Current original-task/parent version or Stop changed before recovery commit.");
+          }
+          // Auth and canonical locks now protect current eligibility and commit.
+          // Disarm read-phase cancellation before our own committed events arrive.
+          yield* Deferred.succeed(committing, undefined);
+          return yield* dispatchWithReceiptBody(recovered, [
+            { threadId: command.threadId, sequence: snapshot.version },
+            ...(snapshot.parentThreadId === undefined ? [] :
+              [{ threadId: snapshot.parentThreadId, sequence: snapshot.parentVersion! }]),
+          ]);
+        }));
+      });
+      return yield* admission.value.withAdmission({ session, operationId: identity.commandId,
+        thread: snapshot.projection.thread, sourceRun, originalInput, providerThread, failure, nativeGoal }, use)
+        .pipe(mapDispatchError(command));
+    });
+    return yield* Effect.raceFirst(preparation, Effect.raceFirst(policyChanged, authorizationChanged));
+  });
+
+  const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
+    command.type === "message.dispatch" && command.automationContinuation !== undefined
+      ? dispatchOriginalTaskRecovery(command)
+      : withCommandLocks(command, dispatchWithReceiptEffect(command));
+
+  // Async questions have no live provider callback. Retire only an obsolete
+  // owning run or an explicit later-run replacement, through the same
+  // cancel-only command used by the question's dismiss button.
+  const retireObsoleteAsyncQuestions = (threadId: ThreadId) =>
+    threadDispatch.withLock(
+      threadId,
+      Effect.gen(function* () {
+        let sequence = yield* eventSink.latestSequence({ threadId });
+        const projection = yield* projectionStore.getThreadRecords(
+          threadId,
+          ["runs", "nodes", "runtimeRequests"],
+          { turnItemTypes: [] },
+        );
+        if ((yield* eventSink.latestSequence({ threadId })) !== sequence) return;
+        const runs = new Map(projection.runs.map((run) => [run.id, run]));
+        const nodes = new Map(projection.nodes.map((node) => [node.id, node]));
+        const questions = projection.runtimeRequests.filter(
+          (request) => request.kind === "user_input" && request.responseCapability.type === "message",
+        );
+        for (const request of questions) {
+          if (request.status !== "pending") continue;
+          const runId = nodes.get(request.nodeId)?.runId;
+          const run = runId == null ? undefined : runs.get(runId);
+          // An interrupt may be resumed after restart. Unknown ownership also
+          // provides no evidence that a question is obsolete.
+          if (run === undefined || run.status === "interrupted") continue;
+          const childEnded =
+            projection.thread.lineage.parentThreadId !== null &&
+            ["completed", "failed", "cancelled", "rolled_back"].includes(run.status);
+          const replaced = questions.some((newer) => {
+            const newerRunId = nodes.get(newer.nodeId)?.runId;
+            const newerRun = newerRunId == null ? undefined : runs.get(newerRunId);
+            return (
+              newer.id !== request.id &&
+              newerRun !== undefined &&
+              newerRun.ordinal > run.ordinal &&
+              DateTime.toEpochMillis(newer.createdAt) >= DateTime.toEpochMillis(request.createdAt)
+            );
+          });
+          if (!childEnded && run.status !== "cancelled" && !replaced) continue;
+          // Capture versions before the eligibility read, and retain them in
+          // the final SQL CAS. Provider events do not take the thread lock.
+          const result = yield* dispatchWithReceiptBody(
+            {
+              type: "thread.user-input.dismiss",
+              commandId: CommandId.make(
+                `command:async-question-retire:${encodeURIComponent(threadId)}:${encodeURIComponent(request.id)}:${sequence}`,
+              ),
+              threadId,
+              requestId: request.id,
+            },
+            [{ threadId, sequence }],
+          );
+          sequence = result.sequence;
+        }
+      }),
+    );
 
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
       const threadId = stored.event.threadId;
+      yield* retireObsoleteAsyncQuestions(threadId).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("Failed to retire obsolete async questions", { threadId, cause })),
+      );
+      // Recording a question can expose a late callback or supersede one
+      // from an older run. It does not release queued work.
+      if (stored.event.type === "runtime-request.updated") return;
       // finalize writes the parent thread and startNextQueuedRun writes this
       // thread, so each takes its own thread's lock, sequentially and never
       // nested: dispatchDelegatedTaskRequest already writes child events
@@ -11185,6 +11516,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             stored.event.payload.status === "cancelled" ||
             stored.event.payload.status === "rolled_back"),
       ),
+      Stream.merge(
+        eventSink
+          .stream({ afterSequence: terminalEventsAfterSequence, eventType: "runtime-request.updated" })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "runtime-request.updated" &&
+                stored.event.payload.kind === "user_input" &&
+                stored.event.payload.status === "pending" &&
+                stored.event.payload.responseCapability.type === "message",
+            ),
+          ),
+      ),
       Stream.runForEach(handleTerminalRun),
       Effect.forkDetach,
     );
@@ -11195,6 +11539,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   // worker. Queue recovery instead holds unstarted runs until an explicit
   // queue.resume command arrives.
   const recoverDelegatedTasks = Effect.gen(function* () {
+    // The existing runtime recovery index includes pending questions. Reuse
+    // it once at boot, before the worker; no new timer or provider work.
+    const questionThreadIds = yield* projectionStore.getRecoveryThreadIds("runtime").pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to inspect async questions during recovery", { cause }).pipe(
+          Effect.as([] as ReadonlyArray<ThreadId>),
+        ),
+      ),
+    );
+    yield* Effect.forEach(questionThreadIds, (threadId) => retireObsoleteAsyncQuestions(threadId).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("Failed to retire obsolete async questions", { threadId, cause })),
+    ), {
+      concurrency: 8,
+      discard: true,
+    });
     yield* projectionStore.getRecoveryThreadIds("subagent-results").pipe(
       Effect.flatMap((threadIds) =>
         Effect.forEach(

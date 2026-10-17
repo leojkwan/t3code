@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   ProviderReplayTranscript,
   ProviderThreadId,
+  ProviderTurnId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -32,6 +33,7 @@ import {
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
+  OrchestrationV2ProviderTurnJson,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
@@ -46,6 +48,41 @@ import {
 } from "./orchestrationV2.ts";
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
+
+it("native terminal assistant identity preserves legacy unknown and exact public message joins", () => {
+  const projection = emptyThreadProjection();
+  const turn = {
+    id: ProviderTurnId.make("provider-turn:final"),
+    providerThreadId: ProviderThreadId.make("provider-thread:final"),
+    nodeId: NodeId.make("node:run"),
+    runAttemptId: RunAttemptId.make("attempt:original"),
+    nativeTurnRef: { driver: "codex", nativeId: "native-turn:original", strength: "strong" },
+    ordinal: 1,
+    status: "completed",
+    startedAt: DateTime.formatIso(now),
+    completedAt: DateTime.formatIso(now),
+  };
+  const decode = Schema.decodeUnknownSync(OrchestrationV2ProviderTurnJson);
+  expect(decode(turn).terminalAssistantMessageId).toBeUndefined();
+  expect(decode({ ...turn, terminalAssistantMessageId: null }).terminalAssistantMessageId).toBeNull();
+  const message = {
+    createdBy: "agent", creationSource: "provider", id: "message:final110",
+    threadId: "thread-1", runId: "run:original", nodeId: "node:final110",
+    role: "assistant", text: "Complete final", attachments: [], streaming: false,
+    createdAt: now, updatedAt: now,
+  };
+  const result = Schema.decodeUnknownSync(OrchestrationV2ThreadProjection)({
+    ...projection,
+    providerTurns: [decode({ ...turn, terminalAssistantMessageId: message.id })],
+    messages: [message],
+  });
+  expect(result.providerTurns[0]?.terminalAssistantMessageId).toBe(message.id);
+  expect(result.providerTurns[0]?.runAttemptId).toBe(turn.runAttemptId);
+  expect(result.messages[0]).toEqual(message);
+  expect(Schema.encodeSync(OrchestrationV2ProviderTurnJson)(result.providerTurns[0]!))
+    .toEqual({ ...turn, terminalAssistantMessageId: message.id });
+});
+
 function emptyThreadProjection() {
   return {
     thread: {
@@ -1567,4 +1604,18 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
+});
+
+
+it("keeps absent and accepted launch receipts distinct and rejects malformed identities", () => {
+  const input = Schema.decodeUnknownSync(OrchestrationV2RpcSchemas.getLaunchReceipt.input);
+  const output = Schema.decodeUnknownSync(OrchestrationV2RpcSchemas.getLaunchReceipt.output);
+  expect(() => input({ commandId: " " })).toThrow();
+  expect(input({ commandId: "legacy-key" })).toEqual({ commandId: "legacy-key" });
+  expect(output({ type: "no_receipt", commandId: "legacy-key" })).toEqual({ type: "no_receipt", commandId: "legacy-key" });
+  expect(output({ type: "accepted", commandId: "legacy-key", threadId: "T_old" })).toEqual({
+    type: "accepted", commandId: "legacy-key", threadId: "T_old",
+  });
+  expect(() => output({ type: "accepted", commandId: "legacy-key", threadId: "" })).toThrow();
+  expect(() => output({ type: "rejected", commandId: "legacy-key" })).toThrow();
 });

@@ -1,7 +1,7 @@
 import { EnvironmentId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { createInboxReturnTracker, sortWorkingThreadsBySend } from "./threadInbox.ts";
+import { isThreadWorking, createInboxReturnTracker, sortWorkingThreadsBySend } from "./threadInbox.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
 
@@ -83,4 +83,13 @@ describe("sortWorkingThreadsBySend", () => {
       sortWorkingThreadsBySend([launched, sentFirst, sentLast]).map((thread) => thread.id),
     ).toEqual(["sent-last", "sent-first", "launched"]);
   });
+});
+
+it("keeps active optional questions working while idle questions and protected input stay in the inbox", () => {
+  const active = { ...thread("async", true), hasPendingUserInput: true, pendingUserInputIsBlocking: false };
+  expect(isThreadWorking(active)).toBe(true);
+  expect(isThreadWorking({ ...active, pendingUserInputIsBlocking: true })).toBe(false);
+  expect(isThreadWorking({ ...thread("legacy", true), hasPendingUserInput: true })).toBe(false);
+  expect(isThreadWorking({ ...active, hasPendingApprovals: true })).toBe(false);
+  expect(isThreadWorking({ ...active, runtime: null })).toBe(false);
 });

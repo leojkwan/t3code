@@ -16,6 +16,9 @@ import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -44,6 +47,9 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -75,6 +81,7 @@ export interface ProviderTurnStartServiceV2Shape {
     readonly threadId: ThreadId;
     readonly runId: RunId;
     readonly willRetry?: boolean;
+    readonly effectId?: string;
   }) => Effect.Effect<void, ProviderTurnStartError>;
 }
 
@@ -111,6 +118,9 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const nativeAdmission = yield* Effect.serviceOption(RpcAuthorization.OriginalTaskRecoveryAdmission);
+    const authSessions = yield* Effect.serviceOption(SessionStore.SessionStore);
+    const nativeAccountControl = yield* Effect.serviceOption(ProviderTurnControlService.ProviderTurnControlServiceV2);
 
     // These callbacks outlive startup while a run drains background work. Build
     // them outside start's scope so they cannot retain its full thread history.
@@ -219,6 +229,8 @@ export const layer: Layer.Layer<
       readonly threadId: ThreadId;
       readonly runId: RunId;
       readonly willRetry?: boolean;
+      readonly scheduledTarget?: RpcAuthorization.ScheduledTaskRunTarget;
+      readonly scheduledBinding?: RpcAuthorization.ScheduledTaskNativeBinding;
     }) {
       const { runId } = input;
       const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
@@ -278,6 +290,25 @@ export const layer: Layer.Layer<
         return yield* new ProviderTurnStartError({
           runId,
           cause: `Run ${runId} is missing its execution projection state.`,
+        });
+      }
+      if (message.scheduledTaskId !== undefined) {
+        const target = input.scheduledTarget;
+        if (target === undefined || input.scheduledBinding === undefined ||
+          target.run.id !== run.id || target.run.activeAttemptId !== attempt.id ||
+          target.originalInput.id !== message.id || target.originalInput.scheduledTaskId !== message.scheduledTaskId ||
+          target.originalInput.text !== message.text ||
+          JSON.stringify(target.originalInput.attachments) !== JSON.stringify(message.attachments) ||
+          target.providerThread.id !== providerThread.id ||
+          target.providerThread.providerSessionId !== providerThread.providerSessionId || run.queueHeld === true ||
+          !modelSelectionsEqual(target.run.modelSelection, run.modelSelection)) {
+          return yield* new ProviderTurnStartError({ runId, cause:
+            new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "run_binding_changed" }) });
+        }
+        if (message.attachments.length === 0 &&
+          (/^\/goal(?:\s|$)/u.test(message.text.trim()) || ["/compact", "/logout"].includes(message.text.trim().toLowerCase())))
+          return yield* new ProviderTurnStartError({
+          runId, cause: "Scheduled native control commands require an actual human command path.",
         });
       }
       // Settles a run that never reached the provider: one signal turn item plus
@@ -587,6 +618,15 @@ export const layer: Layer.Layer<
         return;
       }
       const session = sessionResult.success;
+      if (input.scheduledBinding !== undefined) {
+        if (Option.isNone(nativeAccountControl)) return yield* new ProviderTurnStartError({
+          runId, cause: "Resident native account read control is unavailable.",
+        });
+        yield* nativeAccountControl.value.readNativeAccount({
+          threadId: input.threadId, sourceRunId: run.id, providerSessionId,
+          providerThreadId: providerThread.id, expectedAccountId: input.scheduledBinding.expectedAccountId,
+        }).pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })));
+      }
       // Only the provider's own thread load fails the run on the last attempt;
       // store, id and handoff failures around it keep their typed errors.
       const loadFromProvider = (
@@ -1224,7 +1264,7 @@ export const layer: Layer.Layer<
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
-      yield* runExecution.startRootRun({
+      return yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
         providerSessionId,
@@ -1279,7 +1319,52 @@ export const layer: Layer.Layer<
 
     return ProviderTurnStartServiceV2.of({
       start: (input) =>
-        start(input).pipe(
+        Effect.gen(function* () {
+          const projection = yield* projectionStore.getTurnStartContext(input.threadId, input.runId);
+          const run = projection.runs.find((candidate) => candidate.id === input.runId);
+          const message = projection.messages.find((candidate) => candidate.id === run?.userMessageId);
+          if (message?.scheduledTaskId === undefined) return yield* start(input).pipe(Effect.asVoid);
+          if (run?.status !== "starting") return;
+          const providerThread = projection.providerThreads.find((candidate) => candidate.id === run.providerThreadId);
+          const withRunAdmission = Option.isSome(nativeAdmission) ? nativeAdmission.value.withScheduledRunAdmission : undefined;
+          if (withRunAdmission === undefined || Option.isNone(authSessions) || input.effectId === undefined ||
+            providerThread === undefined || run.activeAttemptId === null || run.queueHeld === true) {
+            return yield* new ProviderTurnStartError({ runId: input.runId, cause:
+              new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "scheduled_binding_unavailable" }) });
+          }
+          const target: RpcAuthorization.ScheduledTaskRunTarget = {
+            type: "scheduled_run", effectId: input.effectId, thread: projection.thread,
+            run, originalInput: message, providerThread,
+          };
+          const started = yield* Deferred.make<void, ProviderTurnStartError>();
+          const lifetime = withRunAdmission(target, (binding) => Effect.gen(function* () {
+            yield* authSessions.value.withCurrentAuthorization(binding.session, Effect.void);
+            const use = Effect.gen(function* () {
+              const owned = yield* start({ ...input, scheduledTarget: target, scheduledBinding: binding });
+              if (owned === undefined) return yield* new RpcAuthorization.ScheduledTaskAdmissionRefused({
+                reason: "owned_join_unavailable",
+              });
+              // Only launch startup settles the outbox. Admission remains in
+              // this fiber until the native finalizers and original stream join.
+              yield* Deferred.succeed(started, undefined);
+              yield* owned.awaitOwnedJoin.pipe(Effect.onInterrupt(() => owned.interruptAndAwaitOwnedJoin));
+            });
+            const revoked = authSessions.value.awaitInvalidation(binding.session.sessionId, binding.session.purpose)
+              .pipe(Effect.andThen(Effect.fail(new RpcAuthorization.ScheduledTaskAdmissionRefused({
+                reason: "session_authority_unavailable",
+              }))));
+            return yield* Effect.raceFirst(use, revoked);
+          })).pipe(
+            Effect.mapError((cause) => new ProviderTurnStartError({ runId: input.runId, cause })),
+            Effect.onExit((exit) => Exit.isFailure(exit) ? Deferred.failCause(started, exit.cause)
+              : Deferred.succeed(started, undefined)),
+          );
+          const lifetimeFiber = yield* lifetime.pipe(Effect.forkDetach);
+          // Until startup is acknowledged, the existing outbox cancellation
+          // still owns this preparation. Afterwards the admission fiber owns
+          // the actual run and native/host invalidation joins it separately.
+          yield* Deferred.await(started).pipe(Effect.onInterrupt(() => Fiber.interrupt(lifetimeFiber)));
+        }).pipe(
           Effect.mapError((cause) =>
             isProviderTurnStartError(cause)
               ? cause

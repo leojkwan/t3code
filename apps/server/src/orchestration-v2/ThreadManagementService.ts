@@ -9,6 +9,7 @@ import type {
 } from "./ProjectionStore.ts";
 import {
   type ChatAttachment,
+  type AuthSessionPurpose,
   CommandId,
   MessageId,
   OrchestrationV2StopWorkflowError,
@@ -59,6 +60,19 @@ export interface ThreadManagementProvenance {
   readonly creationSource: OrchestrationV2CreationSource;
 }
 
+/** Legacy human clients retain their current source; classified automation is server input. */
+export function authenticatedCreationProvenance(
+  purpose: AuthSessionPurpose | null | undefined,
+  command: OrchestrationV2Command,
+): ThreadManagementProvenance {
+  return purpose === "automation"
+    ? { createdBy: "agent", creationSource: "server" }
+    : {
+        createdBy: "user",
+        creationSource: "creationSource" in command ? command.creationSource ?? "web" : "web",
+      };
+}
+
 export function withCreationProvenance(
   command: OrchestrationV2Command,
   provenance: ThreadManagementProvenance,
@@ -69,6 +83,7 @@ export function withCreationProvenance(
     case "thread.fork":
     case "thread.merge_back":
     case "delegated_task.request":
+    case "runtime-request.respond":
       return { ...command, ...provenance };
     default:
       return command;

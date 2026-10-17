@@ -82,6 +82,17 @@ const requestMetadata = {
 };
 
 it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
+  it.effect("carries issuer purpose through the existing authenticated HTTP route without inferring bearer or subject", () =>
+    Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sessions = yield* SessionStore.SessionStore;
+      const automation = yield* sessions.issue({ purpose: "automation", subject: "browser", method: "bearer-access-token" });
+      const legacy = yield* sessions.issue({ subject: "cli-issued-session", method: "bearer-access-token" });
+      expect((yield* auth.authenticateHttpRequest(makeBearerRequest(automation.token))).purpose).toBe("automation");
+      expect((yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token))).purpose).toBeNull();
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
   it.effect("uses the reusable dev cookie without overriding a normal scoped cookie", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

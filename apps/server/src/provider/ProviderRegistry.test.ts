@@ -4,6 +4,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert, expect } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Cache from "effect/Cache";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
@@ -3273,6 +3274,42 @@ it.layer(
       ),
     );
 
+    it.effect("preserves cached usage observation across newer health checks and advances only on a fresh probe", () =>
+      Effect.gen(function* () {
+        let usageReads = 0;
+        const cache = yield* Cache.make({ capacity: 1, timeToLive: "5 minutes", lookup: () =>
+          Effect.gen(function* () {
+            usageReads++;
+            return { ...(yield* claudeCapabilities({ tokenSource: "oauth", subscriptionType: "maxplan" })()),
+              usage: { rate_limits_available: true, rate_limits: {}, observedAt: DateTime.formatIso(yield* DateTime.now) } };
+          }),
+        });
+        const resolve = () => Cache.get(cache, "same-owned-login");
+        const first = yield* checkClaudeProviderStatus(defaultClaudeSettings, resolve);
+        const originalObservation = first.usageLimits!.checkedAt;
+        yield* TestClock.adjust("1 minute");
+        const goalRequestedAt = DateTime.formatIso(yield* DateTime.now);
+        const failed = yield* checkClaudeProviderStatus(defaultClaudeSettings, claudeCapabilities({ tokenSource: "oauth" }));
+        assert.equal(failed.usageLimits?.unavailable?.reason, "probeFailed");
+        yield* TestClock.adjust("1 second");
+        const delayedCached = yield* checkClaudeProviderStatus(defaultClaudeSettings, resolve);
+        assert.equal(usageReads, 1);
+        assert.notEqual(delayedCached.checkedAt, first.checkedAt);
+        assert.equal(delayedCached.usageLimits?.checkedAt, originalObservation);
+        assert.isBelow(Date.parse(delayedCached.usageLimits!.checkedAt), Date.parse(goalRequestedAt));
+        assert.isAbove(Date.parse(delayedCached.checkedAt), Date.parse(goalRequestedAt));
+        // The producer supplies the pre-request observation despite later status delivery.
+        // The separate CLI consumer must refuse it; this test does not invoke that CLI.
+        yield* TestClock.adjust("5 minutes");
+        const fresh = yield* checkClaudeProviderStatus(defaultClaudeSettings, resolve);
+        assert.equal(usageReads, 2);
+        assert.isAbove(Date.parse(fresh.usageLimits!.checkedAt), Date.parse(originalObservation));
+      }).pipe(Effect.provide(layerMockSpawner((args) => {
+        if (args.join(" ") === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+        throw new Error(`Unexpected args: ${args.join(" ")}`);
+      }))),
+    );
+
     it.effect("returns a display label for claude subscription types", () =>
       Effect.gen(function* () {
         const status = yield* checkClaudeProviderStatus(
@@ -3313,7 +3350,7 @@ it.layer(
                 apiKeySource: undefined,
                 apiProvider: undefined,
                 slashCommands: [],
-                usage: { rate_limits_available: true, rate_limits: {} },
+                usage: { rate_limits_available: true, rate_limits: {}, observedAt: "2026-10-11T00:00:00.000Z" },
                 ...overrides,
               }),
             undefined,

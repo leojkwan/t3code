@@ -14,6 +14,8 @@ import {
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
   AuthClientSession,
+  AuthClassifyClientSessionInput,
+  type AuthSessionPurpose,
   AuthCreatePairingCredentialInput,
   AuthMcpApprovalDecisionRequest,
   AuthMcpApprovalDetails,
@@ -103,6 +105,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
+  "automation_session_classification_not_allowed",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
@@ -117,6 +120,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "pairing_link_revoke_failed",
   "client_sessions_load_failed",
   "client_session_revoke_failed",
+  "client_session_classification_failed",
   "project_snapshot_failed",
   "project_mutation_failed",
   "orchestration_snapshot_failed",
@@ -373,6 +377,7 @@ const EnvironmentProjectMutationErrors = [
 
 export interface EnvironmentSessionPrincipalShape {
   readonly sessionId: AuthSessionId;
+  readonly purpose?: AuthSessionPurpose | null;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlySet<AuthEnvironmentScope>;
@@ -517,6 +522,14 @@ class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       headers: OptionalBearerHeaders,
       payload: AuthRevokeClientSessionInput,
       success: AuthClientSessionRevokeResult,
+      error: EnvironmentSessionRevokeErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("classifyClient", "/api/auth/clients/classify", {
+      headers: OptionalBearerHeaders,
+      payload: AuthClassifyClientSessionInput,
+      success: Schema.Struct({ changed: Schema.Boolean }),
       error: EnvironmentSessionRevokeErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

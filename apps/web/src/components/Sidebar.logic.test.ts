@@ -920,6 +920,15 @@ describe("resolveSidebarThreadStatus", () => {
     ).toBe("approval");
   });
 
+  it("keeps async questions visible without masking active work or protected inputs", () => {
+    const optional = { ...idle, hasPendingUserInput: true, pendingUserInputIsBlocking: false, runtime };
+    expect(resolveSidebarThreadStatus(optional)).toBe("working");
+    expect(resolveSidebarThreadStatus({ ...optional, runtime: null })).toBe("input");
+    expect(resolveSidebarThreadStatus({ ...optional, pendingUserInputIsBlocking: true })).toBe("input");
+    expect(resolveSidebarThreadStatus({ ...optional, hasPendingApprovals: true })).toBe("approval");
+    expect(resolveThreadStatusPill({ thread: { ...makeThread(), ...optional } })).toMatchObject({ label: "Working" });
+  });
+
   it("reports working for running and starting runtimes", () => {
     expect(resolveSidebarThreadStatus({ ...idle, runtime })).toBe("working");
     expect(

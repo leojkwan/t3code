@@ -4,6 +4,8 @@ import * as TerminalManager from "../terminal/Manager.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
+  OrchestrationV2GetLaunchReceiptError,
+  type OrchestrationV2GetLaunchReceiptResult,
   type ChatAttachment,
   type MessageId,
   type ModelSelection,
@@ -43,6 +45,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as PersistenceErrors from "../persistence/Errors.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as Orchestrator from "./Orchestrator.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
@@ -165,6 +168,9 @@ export class ThreadLaunchBaseRefError extends Schema.TaggedError<ThreadLaunchBas
 export class ThreadLaunchService extends Context.Service<
   ThreadLaunchService,
   {
+    readonly getLaunchReceipt: (commandId: CommandId) => Effect.Effect<
+      OrchestrationV2GetLaunchReceiptResult, OrchestrationV2GetLaunchReceiptError
+    >;
     readonly launch: (
       input: ThreadLaunchInput,
     ) => Effect.Effect<
@@ -234,6 +240,37 @@ const make = Effect.gen(function* () {
     receipts
       .getByCommandId(commandId)
       .pipe(Effect.mapError(mapError(input, "read-receipt", input.threadId)));
+
+  const getLaunchReceipt: ThreadLaunchService["Service"]["getLaunchReceipt"] = Effect.fn("ThreadLaunchService.getLaunchReceipt")(
+    function* (commandId) {
+      const refuse = (reason: OrchestrationV2GetLaunchReceiptError["reason"]) =>
+        new OrchestrationV2GetLaunchReceiptError({ commandId, reason });
+      const readError = (error: CommandReceiptStore.CommandReceiptStoreV2Error) => {
+        const cause = error.cause;
+        const malformed = Schema.isSchemaError(cause) ||
+          cause instanceof PersistenceErrors.PersistenceDecodeError ||
+          (cause instanceof PersistenceErrors.PersistenceSqlError && Schema.isSchemaError(cause.cause));
+        return refuse(malformed ? "malformed_receipt" : "read_failed");
+      };
+      const receipt = yield* receipts.getByCommandId(commandId).pipe(Effect.mapError(readError));
+      if (Option.isNone(receipt)) {
+        // The thread getter deliberately hides project receipts. They are a
+        // wrong command kind here, not evidence that this key is unused.
+        const projectReceipt = yield* receipts.getProjectByCommandId(commandId).pipe(Effect.mapError(readError));
+        if (Option.isSome(projectReceipt)) return yield* refuse("wrong_command_kind");
+        return { type: "no_receipt" as const, commandId };
+      }
+      if (receipt.value.commandId !== commandId) return yield* refuse("malformed_receipt");
+      if (receipt.value.commandType !== "thread.create") return yield* refuse("wrong_command_kind");
+      if (receipt.value.status !== "accepted") return yield* refuse("not_accepted");
+      if (receipt.value.error !== null) return yield* refuse("malformed_receipt");
+      const shell = yield* threads.getThreadShell(receipt.value.threadId).pipe(
+        Effect.mapError(() => refuse("thread_read_failed")),
+      );
+      return { type: "accepted" as const, commandId, threadId: receipt.value.threadId,
+        ...(shell === null ? {} : { projectId: shell.projectId }) };
+    },
+  );
 
   const validateReusableThread = Effect.fn("ThreadLaunchService.validateReusableThread")(function* (
     input: ThreadLaunchInput,
@@ -1050,7 +1087,7 @@ const make = Effect.gen(function* () {
     );
   };
 
-  return ThreadLaunchService.of({ launch, checkWorktreeBase, retryPreparation });
+  return ThreadLaunchService.of({ getLaunchReceipt, launch, checkWorktreeBase, retryPreparation });
 });
 
 export const layer = Layer.effect(ThreadLaunchService, make);

@@ -1087,6 +1087,10 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   ]),
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
+  /** Explicit native final item completed in this successfully completed turn.
+   * Absent/null is unknown, including legacy records and unsupported providers.
+   * Consumers must still join the exact run, attempt and assistant message. */
+  terminalAssistantMessageId: Schema.optional(Schema.NullOr(MessageId)),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
 });
@@ -1202,6 +1206,9 @@ export const OrchestrationV2Notification = Schema.Struct({
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  automationContinuation: Schema.optional(
+    Schema.Struct({ sourceRunId: RunId, originalInputMessageId: MessageId }),
+  ),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -1911,6 +1918,8 @@ export const OrchestrationV2PendingRuntimeRequestSummary = Schema.Struct({
   id: RuntimeRequestId,
   kind: OrchestrationV2RuntimeRequest.fields.kind,
   createdAt: Schema.DateTimeUtc,
+  /** Absent on older servers; clients conservatively treat the request as blocking. */
+  responseCapability: Schema.optional(OrchestrationV2RuntimeRequest.fields.responseCapability),
 });
 export type OrchestrationV2PendingRuntimeRequestSummary =
   typeof OrchestrationV2PendingRuntimeRequestSummary.Type;
@@ -2932,6 +2941,10 @@ export const OrchestrationV2Command = Schema.Union([
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
+    /** An original-task recovery request; canonical authority remains server-owned. */
+    automationContinuation: Schema.optional(
+      Schema.Struct({ sourceRunId: RunId, originalInputMessageId: MessageId }),
+    ),
     commandId: CommandId,
     threadId: ThreadId,
     messageId: MessageId,
@@ -3064,6 +3077,14 @@ export const OrchestrationV2Command = Schema.Union([
     decision: Schema.optional(ProviderApprovalDecision),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
+    createdBy: Schema.optional(OrchestrationV2Actor),
+    creationSource: Schema.optional(OrchestrationV2CreationSource),
+    /** Resolve related async questions atomically and deliver one continuation. */
+    additionalAnswers: Schema.optional(
+      Schema.Array(
+        Schema.Struct({ requestId: RuntimeRequestId, answers: ProviderUserInputAnswers }),
+      ).check(Schema.isMaxLength(31)),
+    ),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.user-input.dismiss"),
@@ -3248,6 +3269,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   stopWorkflow: "orchestration.stopWorkflow",
   getTurnItem: "orchestration.getTurnItem",
   launchThread: "orchestration.launchThread",
+  getLaunchReceipt: "orchestration.getLaunchReceipt",
   subscribeArchivedShell: "orchestration.subscribeArchivedShell",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
@@ -3309,6 +3331,31 @@ export const OrchestrationV2ThreadLaunchResult = Schema.Struct({
   resumed: Schema.Boolean,
 });
 export type OrchestrationV2ThreadLaunchResult = typeof OrchestrationV2ThreadLaunchResult.Type;
+
+/** Read-only command identity; absence does not admit a later launch. */
+export const OrchestrationV2GetLaunchReceiptInput = Schema.Struct({ commandId: CommandId });
+export const OrchestrationV2GetLaunchReceiptResult = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("no_receipt"), commandId: CommandId }),
+  Schema.Struct({
+    type: Schema.Literal("accepted"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    projectId: Schema.optional(ProjectId),
+  }),
+]);
+export type OrchestrationV2GetLaunchReceiptResult = typeof OrchestrationV2GetLaunchReceiptResult.Type;
+
+export class OrchestrationV2GetLaunchReceiptError extends Schema.TaggedError<OrchestrationV2GetLaunchReceiptError>()(
+  "OrchestrationV2GetLaunchReceiptError",
+  {
+    commandId: CommandId,
+    reason: Schema.Literals(["read_failed", "malformed_receipt", "wrong_command_kind", "not_accepted", "thread_read_failed"]),
+  },
+) {
+  override get message(): string {
+    return `Cannot read launch receipt ${this.commandId}: ${this.reason}.`;
+  }
+}
 
 export const OrchestrationV2DispatchCommandResult = Schema.Struct({
   sequence: NonNegativeInt,
@@ -3565,6 +3612,7 @@ export const OrchestrationV2RpcError = Schema.Union([
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2ThreadLaunchError,
+  OrchestrationV2GetLaunchReceiptError,
   OrchestrationV2StopWorkflowError,
 ]);
 export type OrchestrationV2RpcError = typeof OrchestrationV2RpcError.Type;
@@ -3767,6 +3815,10 @@ export const OrchestrationV2RpcSchemas = {
   launchThread: {
     input: OrchestrationV2ThreadLaunchInput,
     output: OrchestrationV2ThreadLaunchResult,
+  },
+  getLaunchReceipt: {
+    input: OrchestrationV2GetLaunchReceiptInput,
+    output: OrchestrationV2GetLaunchReceiptResult,
   },
   subscribeArchivedShell: {
     input: Schema.Struct({}),

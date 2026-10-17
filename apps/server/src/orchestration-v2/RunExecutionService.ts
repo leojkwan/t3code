@@ -549,7 +549,13 @@ export interface RunExecutionServiceV2StartRootRunInput {
 export interface RunExecutionServiceV2Shape {
   readonly startRootRun: (
     input: RunExecutionServiceV2StartRootRunInput,
-  ) => Effect.Effect<void, RunExecutionServiceV2Error>;
+  ) => Effect.Effect<RunExecutionOwnedLifetime | void, RunExecutionServiceV2Error>;
+}
+
+/** The existing ingestion fiber belongs to this exact run/attempt, after launch settlement. */
+export interface RunExecutionOwnedLifetime {
+  readonly awaitOwnedJoin: Effect.Effect<void, RunExecutionServiceV2Error>;
+  readonly interruptAndAwaitOwnedJoin: Effect.Effect<void, RunExecutionServiceV2Error>;
 }
 
 export class RunExecutionServiceV2 extends Context.Service<
@@ -1436,6 +1442,28 @@ export const layer: Layer.Layer<
             runtimePolicy: input.runtimePolicy,
             ...(appContext.length === 0 ? {} : { appContext }),
           };
+          const awaitOwnedJoin = Fiber.join(providerEventFiber).pipe(Effect.asVoid);
+          const interruptAndAwaitOwnedJoin = yield* Effect.cached(Effect.gen(function* () {
+              const routing = yield* Ref.get(eventRouting);
+              const terminal = yield* Ref.get(terminalEvent);
+              if (routing.rootProviderTurnId === null) {
+                if (terminal === null) return yield* new RunExecutionStartError({
+                  commandId: input.commandId, runId: input.run.id,
+                  cause: "Exact native turn identity is unavailable for owned interruption.",
+                });
+              } else {
+                yield* input.session.interruptTurn({
+                  providerThread: input.providerThread, providerTurnId: routing.rootProviderTurnId,
+                }).pipe(Effect.mapError((cause) => new RunExecutionStartError({
+                  commandId: input.commandId, runId: input.run.id, cause,
+                })));
+              }
+              // Native interruption must finish its own finalizers first. The
+              // run's original stream then drains and closes its subscription.
+              // Never cancel this ingestion fiber to manufacture an owned join.
+              yield* awaitOwnedJoin;
+            }));
+          const ownedLifetime = { awaitOwnedJoin, interruptAndAwaitOwnedJoin } satisfies RunExecutionOwnedLifetime;
           const compact =
             input.message.attachments.length === 0 &&
             input.message.text.trim().toLowerCase() === "/compact";
@@ -1453,7 +1481,9 @@ export const layer: Layer.Layer<
             : input.session.startTurn(turnInput);
           yield* Effect.andThen(shouldStart, startTurn).pipe(
             Effect.catchCause((cause) =>
-              Effect.logError("orchestration V2 provider turn start failed", {
+              input.message.scheduledTaskId !== undefined
+                ? ownedLifetime.interruptAndAwaitOwnedJoin.pipe(Effect.andThen(Effect.failCause(cause)))
+                : Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,
                 cause,
               }).pipe(
@@ -1503,7 +1533,10 @@ export const layer: Layer.Layer<
                 ),
               ),
             ),
+            Effect.onInterrupt(() => input.message.scheduledTaskId === undefined
+              ? Effect.void : ownedLifetime.interruptAndAwaitOwnedJoin),
           );
+          return ownedLifetime;
         }),
     } satisfies RunExecutionServiceV2Shape);
   }),

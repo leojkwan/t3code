@@ -126,6 +126,8 @@ export interface EventSinkV2Shape {
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
+    /** Server-owned preparation versions; compare in the same transaction as effects. */
+    readonly expectedThreadVersions?: ReadonlyArray<{ readonly threadId: ThreadId; readonly sequence: number }>;
     readonly cancelUnsettledEffects?: {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
@@ -541,6 +543,13 @@ const layerBase: Layer.Layer<
           if (!reserved) {
             const existing = yield* existingCommandResult(input.commandId);
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
+          }
+
+          for (const expected of input.expectedThreadVersions ?? []) {
+            const current = yield* eventStore.latestSequence({ threadId: expected.threadId });
+            if (current !== expected.sequence) {
+              return yield* Effect.fail(new Error("Original-task preparation version changed before atomic commit."));
+            }
           }
 
           const normalized = yield* normalizeEvents(input.events);

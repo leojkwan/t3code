@@ -667,11 +667,13 @@ describe("makeManagedServerProvider", () => {
         );
         assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
         assert.deepStrictEqual(enriched.usageLimits?.windows, [liveWindow]);
+        assert.strictEqual(enriched.usageLimits?.checkedAt, "2026-04-10T00:00:02.000Z");
 
         // A probe that could not read usage keeps the last good windows.
         const refreshed = yield* provider.refresh;
         assert.strictEqual(refreshed.message, refreshedSnapshotSecond.message);
         assert.deepStrictEqual(refreshed.usageLimits?.windows, [liveWindow]);
+        assert.strictEqual(refreshed.usageLimits?.checkedAt, "2026-04-10T00:00:02.000Z");
         // ...and the workspace they were read for.
         assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
 

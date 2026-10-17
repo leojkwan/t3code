@@ -54,6 +54,29 @@ export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
 });
 export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePolicy.Type;
 
+/** Fresh native response; preserve identity, accounting and optional-budget presence. */
+export const ProviderAdapterV2NativeGoal = Schema.Struct({
+  threadId: Schema.String,
+  objective: Schema.String,
+  status: Schema.Literals(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]),
+  tokensUsed: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+  /** Explicit native null means no native cap on the matching goal protocol; absent stays unknown. */
+  tokenBudget: Schema.optionalKey(Schema.NullOr(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)))),
+  timeUsedSeconds: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+  createdAt: Schema.Number.check(Schema.isInt()),
+  updatedAt: Schema.Number.check(Schema.isInt()),
+});
+export type ProviderAdapterV2NativeGoal = typeof ProviderAdapterV2NativeGoal.Type;
+
+/** SDK-decoded observations from one resident runtime. They do not grant task authority. */
+export const ProviderAdapterV2NativeAccountObservation = Schema.Struct({
+  account: Schema.Record(Schema.String, Schema.Unknown),
+  rateLimits: Schema.Record(Schema.String, Schema.Unknown),
+  accountObservedAtMs: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+  usageObservedAtMs: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+});
+export type ProviderAdapterV2NativeAccountObservation = typeof ProviderAdapterV2NativeAccountObservation.Type;
+
 export const ProviderAdapterV2TurnMessage = Schema.Struct({
   messageId: MessageId,
   text: Schema.String,
@@ -621,6 +644,14 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly readThreadSnapshot: (
     input: ProviderAdapterV2ReadThreadSnapshotInput,
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;
+  /** Read only from this resident runtime; never opens, resumes or starts a turn. */
+  readonly readNativeGoal?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<ProviderAdapterV2NativeGoal | null, ProviderAdapterV2Error>;
+  /** No token refresh, goal mutation, session open or work-producing native call. */
+  readonly readNativeAccount?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<ProviderAdapterV2NativeAccountObservation, ProviderAdapterV2Error>;
   /**
    * Providers that accept product feedback for a thread (#7949, Codex → OpenAI)
    * expose it here; absent means the driver has no feedback channel.

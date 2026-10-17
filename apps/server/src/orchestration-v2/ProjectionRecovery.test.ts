@@ -12,6 +12,8 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -609,5 +611,76 @@ it.effect("marks fork descendants unreadable when their source is missing or cor
       new Set(yield* projections.getUnreadableThreadIds()),
       new Set([fork, descendant]),
     );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+
+it.effect("native terminal assistant identity survives SQLite service restart without certifying legacy or a later run", () =>
+  Effect.gen(function* () {
+    // Storage/recovery contract only, independent of native finality. The
+    // adapter suite provides the decoded native producer + EventSink walk.
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* DateTime.now;
+    const threadId = yield* createThread("terminal-identity");
+    const originalRunId = yield* createRun(threadId, "completed", {
+      activeAttemptId: RunAttemptId.make("original-attempt"),
+    });
+    const laterRunId = yield* createRun(threadId, "completed", { ordinal: 2 });
+    const finalId = MessageId.make("message:final110");
+    const inputId = MessageId.make(`message:${originalRunId}`);
+    const steerId = MessageId.make("message:original-steer");
+    const laterInputId = MessageId.make(`message:${laterRunId}`);
+    for (const [id, runId, role, text] of [
+      [inputId, originalRunId, "user", "Original accepted input"],
+      [steerId, originalRunId, "user", "Same-run steer"],
+      [finalId, originalRunId, "assistant", "Complete final"],
+      [MessageId.make("message:commentary111"), originalRunId, "assistant", "get the Resplit fixes to"],
+      [laterInputId, laterRunId, "user", "Later accepted input"],
+    ] as const) {
+      yield* projections.apply({ id: EventId.make(`event:${id}`), type: "message.updated",
+        threadId, runId, occurredAt: now, payload: {
+          createdBy: role === "user" ? "user" : "agent", creationSource: role === "user" ? "web" : "provider",
+          id, threadId, runId, nodeId: role === "assistant" ? NodeId.make(`node:${id}`) : null,
+          role, text, attachments: [], streaming: false, createdAt: now, updatedAt: now,
+        } });
+    }
+    const originalTurnId = ProviderTurnId.make("provider-turn:original");
+    const legacyTurnId = ProviderTurnId.make("provider-turn:legacy-later");
+    for (const [id, attempt, ordinal, certificate] of [
+      [originalTurnId, RunAttemptId.make("original-attempt"), 1, { terminalAssistantMessageId: finalId }],
+      [legacyTurnId, null, 2, {}],
+    ] as const) {
+      yield* projections.apply({ id: EventId.make(`event:${id}`), type: "provider-turn.updated",
+        threadId, occurredAt: now, payload: {
+          id, providerThreadId: ProviderThreadId.make("provider-thread:recovery"),
+          nodeId: NodeId.make(`root:${ordinal}`), runAttemptId: attempt,
+          nativeTurnRef: { driver, nativeId: `native-turn:${ordinal}`, strength: "strong" },
+          ordinal, status: "completed", startedAt: now, completedAt: now, ...certificate,
+        } });
+    }
+    const persisted = yield* sql<{ payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_provider_turns
+      WHERE provider_turn_id = ${originalTurnId}
+    `;
+    assert.equal(JSON.parse(persisted[0]!.payload_json).terminalAssistantMessageId, finalId);
+    // A new service reads existing SQLite rows, not the old projection object.
+    const restarted = yield* ProjectionStore.ProjectionStoreV2.pipe(
+      Effect.provide(Layer.fresh(ProjectionStore.layer)),
+    );
+    const projection = yield* restarted.getThreadProjection(threadId);
+    assert.equal(projection.providerTurns.find((turn) => turn.id === originalTurnId)?.terminalAssistantMessageId, finalId);
+    assert.isUndefined(projection.providerTurns.find((turn) => turn.id === legacyTurnId)?.terminalAssistantMessageId);
+    for (const acceptedId of [inputId, steerId]) {
+      const owningRunId = projection.messages.find((message) => message.id === acceptedId)?.runId;
+      assert.equal(owningRunId, originalRunId);
+      const attemptId = projection.runs.find((run) => run.id === owningRunId)?.activeAttemptId;
+      const turn = projection.providerTurns.find((candidate) => candidate.runAttemptId === attemptId);
+      assert.equal(turn?.terminalAssistantMessageId, finalId);
+      assert.equal(projection.messages.find((message) => message.id === turn?.terminalAssistantMessageId)?.runId, owningRunId);
+    }
+    assert.equal(projection.messages.find((message) => message.id === laterInputId)?.runId, laterRunId);
+    assert.isNull(projection.runs.find((run) => run.id === laterRunId)?.activeAttemptId);
+    assert.equal(projection.messages.find((message) => message.id === finalId)?.text, "Complete final");
   }).pipe(Effect.provide(layerTest)),
 );

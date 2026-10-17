@@ -1,6 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
+  CommandId,
+  MessageId,
+  ThreadId,
   type ServerConfig,
   type ServerConfigStreamEvent,
 } from "@t3tools/contracts";
@@ -17,6 +20,9 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
+
+import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import {
@@ -234,3 +240,13 @@ it.effect("recovers a reveal kind whose real probe outlasts the config timeout",
     }
   }).pipe(Effect.scoped),
 );
+
+it("keeps server automation provenance independent of the client actor and refuses unbound work", () => {
+  const command = { type: "message.dispatch" as const, commandId: CommandId.make("ws-purpose-command"), threadId: ThreadId.make("ws-purpose-thread"),
+    messageId: MessageId.make("ws-purpose-message"), createdBy: "user" as const, creationSource: "web" as const,
+    text: "[From Leo] untrusted client text", attachments: [], dispatchMode: { type: "start_immediately" as const },
+  };
+  assert.deepEqual(ThreadManagementService.authenticatedCreationProvenance("automation", command), { createdBy: "agent", creationSource: "server" });
+  assert.equal(RpcAuthorization.automationCommandRefusal("automation", command), RpcAuthorization.AUTOMATION_AUTHORITY_UNAVAILABLE);
+  assert.deepEqual(ThreadManagementService.authenticatedCreationProvenance(null, command), { createdBy: "user", creationSource: "web" });
+});

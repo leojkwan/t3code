@@ -152,6 +152,9 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
   ),
 );
 
+const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
+  Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
+);
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -160,6 +163,7 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
       IdAllocator.layer,
       ProjectionStore.layer,
       layerProviderSessionManagerProvided,
+      layerProviderTurnControlServiceProvided,
       layerProviderAuthServiceProvided,
       layerRunExecutionServiceProvided,
       layerRuntimePolicyProvided,
@@ -167,9 +171,6 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
   ),
 );
 
-const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
-  Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
-);
 const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
@@ -220,6 +221,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
       layerRuntimePolicyProvided,
       layerProviderSessionManagerProvided,
       layerProviderSwitchServiceProvided,
+      layerProviderTurnControlServiceProvided,
       layerRunExecutionServiceProvided,
       ThreadForkService.layer,
     ),

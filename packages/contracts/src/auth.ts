@@ -72,6 +72,10 @@ export type ServerAuthBootstrapMethod = typeof ServerAuthBootstrapMethod.Type;
  * - `dpop-access-token`: scoped proof-of-possession token used by managed
  *   relay connections
  */
+/** Classified by the session issuer, never by client presentation metadata. */
+export const AuthSessionPurpose = Schema.Literals(["human", "automation"]);
+export type AuthSessionPurpose = typeof AuthSessionPurpose.Type;
+
 export const ServerAuthSessionMethod = Schema.Literals([
   "browser-session-cookie",
   "bearer-access-token",
@@ -353,6 +357,7 @@ export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 
 export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
+  purpose: Schema.optionalKey(Schema.NullOr(AuthSessionPurpose)),
   subject: TrimmedNonEmptyString,
   ...authScopeResponseFields,
   method: ServerAuthSessionMethod,
@@ -451,6 +456,14 @@ export const AuthRevokeClientSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
 });
 export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.Type;
+
+/** An administrative CAS on an existing session, never a credential exchange. */
+export const AuthClassifyClientSessionInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  expectedPurpose: Schema.NullOr(AuthSessionPurpose),
+  purpose: AuthSessionPurpose,
+});
+export type AuthClassifyClientSessionInput = typeof AuthClassifyClientSessionInput.Type;
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),

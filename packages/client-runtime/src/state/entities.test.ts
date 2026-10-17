@@ -30,6 +30,21 @@ import { derivePendingThreadRequests } from "./threadRequests.ts";
 
 const environmentId = EnvironmentId.make("environment-v2");
 
+it("preserves async question capability without treating legacy or live input as optional", () => {
+  const request = { id: RuntimeRequestId.make("async"), kind: "user_input" as const, createdAt: v2ThreadShell.createdAt };
+  for (const [responseCapability, blocking] of [
+    [{ type: "message" as const }, false],
+    [{ type: "live" as const, providerSessionId: ProviderSessionId.make("session") }, true],
+    [undefined, true],
+  ] as const) {
+    const shell = presentThreadShell(environmentId, { ...v2ThreadShell,
+      pendingRuntimeRequest: { ...request, ...(responseCapability === undefined ? {} : { responseCapability }) },
+    });
+    expect(shell.hasPendingUserInput).toBe(true);
+    expect(shell.pendingUserInputIsBlocking).toBe(blocking);
+  }
+});
+
 describe("scoped entity keys", () => {
   it("preserves an invalid thread key as structured error data", () => {
     const key = "missing-thread-key-separator";

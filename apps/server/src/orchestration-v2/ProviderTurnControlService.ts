@@ -6,6 +6,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -17,6 +18,7 @@ import * as Schema from "effect/Schema";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -42,7 +44,40 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
 
+export class ProviderNativeGoalReadError extends Schema.TaggedError<ProviderNativeGoalReadError>()(
+  "ProviderNativeGoalReadError", {
+    threadId: ThreadId,
+    reason: Schema.Literals(["target_unavailable", "runtime_unavailable", "unsupported", "read_failed",
+      "identity_mismatch", "goal_unavailable", "goal_inactive", "budget_unavailable", "budget_exhausted"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export class ProviderNativeAccountReadError extends Schema.TaggedError<ProviderNativeAccountReadError>()(
+  "ProviderNativeAccountReadError", {
+    threadId: ThreadId,
+    reason: Schema.Literals(["target_unavailable", "runtime_unavailable", "unsupported", "read_failed",
+      "identity_mismatch", "account_mismatch", "unauthenticated", "usage_unavailable", "usage_denied"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
 export interface ProviderTurnControlServiceV2Shape {
+  /** Read evidence only. expectedAccountId must come from the native authority owner, not a command body. */
+  readonly readNativeAccount: (input: {
+    readonly threadId: ThreadId;
+    readonly sourceRunId: RunId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly expectedAccountId: string;
+  }) => Effect.Effect<ProviderAdapter.ProviderAdapterV2NativeAccountObservation, ProviderNativeAccountReadError>;
+  /** Fresh read of the original resident runtime, including a terminal source run. */
+  readonly readNativeGoal: (input: {
+    readonly threadId: ThreadId;
+    readonly sourceRunId: RunId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+  }) => Effect.Effect<ProviderAdapter.ProviderAdapterV2NativeGoal, ProviderNativeGoalReadError>;
   readonly interrupt: (input: {
     readonly subagent?: { readonly id: NodeId; readonly nativeTaskId: string };
     readonly threadId: ThreadId;
@@ -172,6 +207,121 @@ export const layer: Layer.Layer<
       });
 
     return ProviderTurnControlServiceV2.of({
+      readNativeAccount: (input) => Effect.gen(function* () {
+        const refuse = (reason: ProviderNativeAccountReadError["reason"], cause?: unknown) =>
+          new ProviderNativeAccountReadError({ threadId: input.threadId, reason, ...(cause === undefined ? {} : { cause }) });
+        if (input.expectedAccountId.trim() === "") return yield* refuse("account_mismatch");
+        const readRecords = () => projections.getThreadRecords(input.threadId, ["runs", "providerThreads"], {
+          runIds: [input.sourceRunId],
+        }).pipe(Effect.mapError((cause) => refuse("target_unavailable", cause)));
+        const records = yield* readRecords();
+        const run = records.runs.find((candidate) => candidate.id === input.sourceRunId);
+        const providerThread = records.providerThreads.find((candidate) => candidate.id === input.providerThreadId);
+        if (records.thread.id !== input.threadId || records.thread.deletedAt !== null ||
+          run?.threadId !== input.threadId || run.providerThreadId !== input.providerThreadId ||
+          run.status === "interrupted" || run.status === "cancelled" || run.queueHeld === true ||
+          providerThread?.appThreadId !== input.threadId ||
+          providerThread.providerSessionId !== input.providerSessionId ||
+          run.providerInstanceId !== providerThread.providerInstanceId) {
+          return yield* refuse("identity_mismatch");
+        }
+        const session = yield* sessions.get(input.providerSessionId).pipe(
+          Effect.mapError((cause) => refuse("runtime_unavailable", cause)),
+        );
+        if (Option.isNone(session)) return yield* refuse("runtime_unavailable");
+        const runtime = session.value;
+        if (runtime.providerSessionId !== input.providerSessionId || runtime.instanceId !== providerThread.providerInstanceId ||
+          runtime.driver !== providerThread.driver) return yield* refuse("identity_mismatch");
+        if (runtime.readNativeAccount === undefined) return yield* refuse("unsupported");
+        const raw = yield* runtime.readNativeAccount({ providerThread }).pipe(
+          Effect.mapError((cause) => refuse("read_failed", cause)),
+        );
+        const observation = yield* Schema.decodeUnknownEffect(ProviderAdapter.ProviderAdapterV2NativeAccountObservation)(raw)
+          .pipe(Effect.mapError((cause) => refuse("read_failed", cause)));
+        if (observation.usageObservedAtMs < observation.accountObservedAtMs) return yield* refuse("read_failed");
+        const account = observation.account.account;
+        if (typeof account !== "object" || account === null ||
+          !("type" in account) || typeof account.type !== "string" ||
+          typeof observation.account.requiresOpenaiAuth !== "boolean") return yield* refuse("unauthenticated");
+        if (typeof observation.rateLimits.accountId !== "string" || observation.rateLimits.accountId.trim() === "")
+          return yield* refuse("usage_unavailable");
+        if (observation.rateLimits.accountId !== input.expectedAccountId) return yield* refuse("account_mismatch");
+        if (observation.rateLimits.ordinaryUsageAllowed === false) return yield* refuse("usage_denied");
+        if (observation.rateLimits.ordinaryUsageAllowed !== true) return yield* refuse("usage_unavailable");
+        // Native I/O holds no canonical or global auth lock. Re-read the actual
+        // binding after it returns; this check still does not freeze host policy.
+        const current = yield* readRecords();
+        const bound = current.providerThreads.find((candidate) => candidate.id === input.providerThreadId);
+        const currentRun = current.runs.find((candidate) => candidate.id === input.sourceRunId);
+        const currentSession = yield* sessions.get(input.providerSessionId).pipe(
+          Effect.mapError((cause) => refuse("runtime_unavailable", cause)),
+        );
+        if (current.thread.id !== input.threadId || current.thread.deletedAt !== null ||
+          bound?.providerSessionId !== input.providerSessionId || bound.appThreadId !== input.threadId ||
+          bound.providerInstanceId !== providerThread.providerInstanceId || bound.driver !== providerThread.driver ||
+          bound.nativeThreadRef?.nativeId !== providerThread.nativeThreadRef?.nativeId ||
+          currentRun?.providerThreadId !== input.providerThreadId || currentRun.status !== run.status ||
+          currentRun.activeAttemptId !== run.activeAttemptId || currentRun.queueHeld === true ||
+          Option.isNone(currentSession) || currentSession.value !== runtime) return yield* refuse("identity_mismatch");
+        return observation;
+      }),
+      readNativeGoal: (input) => Effect.gen(function* () {
+        const refuse = (reason: ProviderNativeGoalReadError["reason"], cause?: unknown) =>
+          new ProviderNativeGoalReadError({ threadId: input.threadId, reason, ...(cause === undefined ? {} : { cause }) });
+        // Do not use load(): its terminal-turn fast path discards the resident runtime.
+        const records = yield* projections.getThreadRecords(input.threadId, ["runs", "providerThreads"], {
+          runIds: [input.sourceRunId],
+        }).pipe(Effect.mapError((cause) => refuse("target_unavailable", cause)));
+        const sourceRun = records.runs.find((run) => run.id === input.sourceRunId);
+        const providerThread = records.providerThreads.find((thread) => thread.id === input.providerThreadId);
+        if (records.thread.id !== input.threadId || records.thread.deletedAt !== null ||
+          sourceRun?.providerThreadId !== input.providerThreadId ||
+          providerThread?.appThreadId !== input.threadId ||
+          providerThread.providerSessionId !== input.providerSessionId ||
+          sourceRun.providerInstanceId !== providerThread.providerInstanceId ||
+          providerThread.nativeThreadRef?.strength !== "strong" ||
+          providerThread.nativeThreadRef.driver !== providerThread.driver) {
+          return yield* refuse("identity_mismatch");
+        }
+        const session = yield* sessions.get(input.providerSessionId).pipe(
+          Effect.mapError((cause) => refuse("runtime_unavailable", cause)),
+        );
+        if (Option.isNone(session)) return yield* refuse("runtime_unavailable");
+        const runtime = session.value;
+        if (runtime.providerSessionId !== input.providerSessionId ||
+          runtime.instanceId !== providerThread.providerInstanceId || runtime.driver !== providerThread.driver) {
+          return yield* refuse("identity_mismatch");
+        }
+        if (runtime.readNativeGoal === undefined) {
+          return yield* refuse("unsupported", `${runtime.driver} has no fresh native goal authority read.`);
+        }
+        const raw = yield* runtime.readNativeGoal({ providerThread }).pipe(
+          Effect.mapError((cause) => refuse("read_failed", cause)),
+        );
+        if (raw === null) return yield* refuse("goal_unavailable");
+        const goal = yield* Schema.decodeUnknownEffect(ProviderAdapter.ProviderAdapterV2NativeGoal)(raw).pipe(
+          Effect.mapError((cause) => refuse("read_failed", cause)),
+        );
+        if (goal.threadId !== providerThread.nativeThreadRef.nativeId) return yield* refuse("identity_mismatch");
+        if (goal.status !== "active") return yield* refuse("goal_inactive");
+        if (!Object.hasOwn(goal, "tokenBudget") || goal.tokenBudget === undefined) return yield* refuse("budget_unavailable");
+        // Explicit raw native null is the matching protocol's no-cap mode, not
+        // a default for missing/undecodable data. Host admission still binds the
+        // installed protocol and actual account/goal/resource authority.
+        if (goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) return yield* refuse("budget_exhausted");
+        // Revalidate the durable binding after the asynchronous native reply. The
+        // caller's original-thread lock retains canonical Stop/queue authority.
+        const current = yield* projections.getThreadRecords(input.threadId, ["runs", "providerThreads"], {
+          runIds: [input.sourceRunId],
+        }).pipe(Effect.mapError((cause) => refuse("target_unavailable", cause)));
+        const bound = current.providerThreads.find((thread) => thread.id === input.providerThreadId);
+        if (bound?.providerSessionId !== input.providerSessionId ||
+          bound.nativeThreadRef?.nativeId !== goal.threadId || bound.nativeThreadRef.driver !== providerThread.driver ||
+          current.runs.find((run) => run.id === input.sourceRunId)?.providerThreadId !== input.providerThreadId) {
+          return yield* refuse("identity_mismatch");
+        }
+        return goal;
+      }),
       interrupt: (input) =>
         Effect.gen(function* () {
           const loaded = yield* load({ ...input, operation: "interrupt" });

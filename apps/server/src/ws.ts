@@ -90,6 +90,7 @@ import {
   PersistChatAttachmentsError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  AuthOrchestrationReadScope,
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -1323,6 +1324,7 @@ const layerWsRpc = (
       const withPullRequestViewer = pullRequests.withRoutingCredential;
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const sessions = yield* SessionStore.SessionStore;
+      const recoveryAdmission = yield* Effect.serviceOption(RpcAuthorization.OriginalTaskRecoveryAdmission);
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
       const hostResources = yield* HostResources.HostResources;
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
@@ -1837,34 +1839,60 @@ const layerWsRpc = (
               : {}),
           }).pipe(
             Effect.andThen(
-              startup
-                .enqueueCommand(
-                  // A retry also restarts the preparation work the launch owns.
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
-                )
-                .pipe(
-                  Effect.tap(() => recordClientCommandAnalytics(command)),
-                  Effect.map((result) => ({ sequence: result.sequence })),
-                  Effect.mapError((cause) => {
-                    const detail = userFacingDispatchErrorMessage(cause);
-                    return new OrchestrationV2DispatchCommandError({
-                      commandId: command.commandId,
-                      commandType: command.type,
-                      message: detail ?? "Failed to dispatch orchestration V2 command",
-                      ...(detail === undefined ? {} : { detail }),
-                      cause,
-                    });
-                  }),
-                ),
+              Effect.suspend(() => {
+                const refusal = RpcAuthorization.automationCommandRefusal(
+                  currentSession.purpose,
+                  command,
+                  Option.isSome(recoveryAdmission),
+                );
+                if (refusal !== undefined) {
+                  return Effect.fail(new OrchestrationV2DispatchCommandError({
+                    commandId: command.commandId,
+                    commandType: command.type,
+                    message: refusal,
+                    detail: refusal,
+                  }));
+                }
+                return startup
+                  .enqueueCommand(
+                    // A retry also restarts the preparation work the launch owns.
+                    (command.type === "prepared-run.retry"
+                      ? threadLaunch.retryPreparation(command)
+                      : ThreadMessageIntake.dispatchCommand(
+                          ThreadManagementService.withCreationProvenance(
+                            command,
+                            ThreadManagementService.authenticatedCreationProvenance(
+                              currentSession.purpose,
+                              command,
+                            ),
+                          ),
+                        )
+                    ).pipe(
+                      Effect.provide(intakeContext),
+                      Effect.provideService(
+                        RpcAuthorization.AuthenticatedSessionPurpose,
+                        currentSession.purpose ?? null,
+                      ),
+                      Effect.provideService(RpcAuthorization.AuthenticatedSession, {
+                        sessionId: currentSession.sessionId, purpose: currentSession.purpose ?? null,
+                      }),
+                    ),
+                  )
+                  .pipe(
+                    Effect.tap(() => recordClientCommandAnalytics(command)),
+                    Effect.map((result) => ({ sequence: result.sequence })),
+                    Effect.mapError((cause) => {
+                      const detail = userFacingDispatchErrorMessage(cause);
+                      return new OrchestrationV2DispatchCommandError({
+                        commandId: command.commandId,
+                        commandType: command.type,
+                        message: detail ?? "Failed to dispatch orchestration V2 command",
+                        ...(detail === undefined ? {} : { detail }),
+                        cause,
+                      });
+                    }),
+                  );
+              }),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),
@@ -1950,6 +1978,8 @@ const layerWsRpc = (
                 ),
             ),
           ),
+        [ORCHESTRATION_V2_WS_METHODS.getLaunchReceipt]: (input) =>
+          threadLaunch.getLaunchReceipt(input.commandId),
         [ORCHESTRATION_V2_WS_METHODS.launchThread]: (input) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": input.commandId,
@@ -3193,7 +3223,13 @@ export const layer = Layer.unwrap(
           yield* RpcServer.make(ServerWsRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
             Effect.provideService(RpcServer.Protocol, withTerminalOutputWindow(protocol)),
             Effect.provide(
-              Layer.merge(RpcAuthorization.layer(session.scopes), rpcInstrumentationLayer),
+              Layer.merge(RpcAuthorization.layer(session.scopes, session.purpose ?? null,
+                sessions.assertCurrentAuthorization({ sessionId: session.sessionId, purpose: session.purpose ?? null })
+                  .pipe(Effect.mapError(() => new EnvironmentAuthorizationError({
+                    message: "Session authorization changed; reconnect using the same credential.",
+                    requiredScope: AuthOrchestrationReadScope,
+                  }))),
+              ), rpcInstrumentationLayer),
             ),
             Effect.forkScoped,
           );
@@ -3248,7 +3284,7 @@ export const layer = Layer.unwrap(
           () =>
             Effect.raceFirst(
               rpcWebSocketHttpEffect,
-              sessions.awaitInvalidation(session.sessionId).pipe(
+              sessions.awaitInvalidation(session.sessionId, session.purpose ?? null).pipe(
                 Effect.as(HttpServerResponse.empty()),
                 Effect.catchTags({
                   SessionCredentialVerificationError: (error) =>

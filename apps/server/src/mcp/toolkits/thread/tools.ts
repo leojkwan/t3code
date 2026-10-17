@@ -169,8 +169,25 @@ const PendingRequestReadTool = Tool.make("t3_pending_request_read", {
 const PendingRequestRespondTool = Tool.make("t3_pending_request_respond", {
   ...commandTool,
   description:
-    "Answer a pending user-input request using the existing runtime response command. This cannot approve a permission request.",
-  parameters: Schema.Struct({ ...requestTarget, answers: ProviderUserInputAnswers }),
+    "Answer pending user questions using the existing response command. Supply additionalAnswers for related async questions to deliver one continuation. This cannot approve a permission request.",
+  parameters: Schema.Struct({
+    ...requestTarget,
+    answers: ProviderUserInputAnswers,
+    additionalAnswers: Schema.optional(
+      Schema.Array(
+        Schema.Struct({ requestId: RuntimeRequestId, answers: ProviderUserInputAnswers }),
+      ).check(Schema.isMaxLength(31)),
+    ),
+  }),
+})
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
+const PendingRequestDismissTool = Tool.make("t3_pending_request_dismiss", {
+  ...commandTool,
+  description:
+    "Dismiss a superseded optional async question without answering it or starting a turn. Live blocking questions and approvals cannot be dismissed.",
+  parameters: Schema.Struct(requestTarget),
 })
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
@@ -192,7 +209,7 @@ const ThreadConfigurationTool = Tool.make("t3_thread_configuration", {
 const ThreadConfigureTool = Tool.make("t3_thread_configure", {
   ...commandTool,
   description:
-    "Set a thread's provider, model and options with the existing selection command. Omit threadId for this thread. This does not change permission modes. Use orchestrator_capabilities to choose a selection.",
+    "Set a thread's provider, model and options with the existing selection command. An active agent cannot configure its own thread, with either an omitted or explicit threadId, even for an identical selection. Use t3_thread_configuration to read the current selection. An existing authorized controller can change it after the run finishes and explicitly continue eligible original work. This does not change permission modes. Use orchestrator_capabilities to choose a selection.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     modelSelection: ModelSelection,
@@ -282,6 +299,7 @@ export const ThreadToolkit = Toolkit.make(
   PendingRequestListTool,
   PendingRequestReadTool,
   PendingRequestRespondTool,
+  PendingRequestDismissTool,
   ThreadOrganizeTool,
   QueueListTool,
   QueueReadTool,

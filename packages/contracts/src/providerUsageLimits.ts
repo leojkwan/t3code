@@ -48,6 +48,9 @@ export type ServerProviderResetCredits = typeof ServerProviderResetCredits.Type;
  * last good bars for the latter and clear them for the former.
  */
 export const ServerProviderUsageLimits = Schema.Struct({
+  /** Limits observation time (or conservative fresh-read start), not a later health check.
+   * Cached and last-good limits retain their original time. An unavailable result
+   * may date the failed attempt; it does not establish fresh usable limits. */
   checkedAt: IsoDateTime,
   windows: ForwardCompatibleArray(ServerProviderUsageWindow),
   /** Opaque credential identity when the provider does not report an account. */

@@ -2,6 +2,7 @@
 import * as ClaudeSdk from "@anthropic-ai/claude-agent-sdk";
 import { vi } from "vite-plus/test";
 import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import {
@@ -265,6 +266,7 @@ it.layer(NodeServices.layer)("Claude capability probe SDK boundary", (it) => {
         ),
       );
 
+      const expectedUsageObservedAt = DateTime.formatIso(yield* DateTime.now);
       const capabilities = yield* probeClaudeCapabilities(
         decodeClaudeSettings({ binaryPath: executablePath }),
         {
@@ -291,6 +293,7 @@ it.layer(NodeServices.layer)("Claude capability probe SDK boundary", (it) => {
         usage: {
           rate_limits_available: true,
           rate_limits: { five_hour: { utilization: 12, resets_at: "2026-07-18T14:39:00Z" } },
+          observedAt: expectedUsageObservedAt,
         },
       });
 
@@ -372,5 +375,40 @@ it.effect("asks for usage without the local transcript scan", () =>
     yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
     yield* probeClaudeCapabilities(decodeClaudeSettings({ binaryPath: "claude" }));
     assert.deepEqual(usageOptions, { skipBehaviors: true });
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+
+it.effect("dates a successful SDK usage response when received, not when initialization or a later health check starts", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    let releaseUsage: (() => void) | undefined;
+    const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(() => ({
+      initializationResult: async () => ({ account: { tokenSource: "oauth" }, commands: [] }),
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: () => new Promise((resolve) => {
+        releaseUsage = () => resolve({ rate_limits_available: true, rate_limits: {} });
+        Deferred.doneUnsafe(entered, Effect.void);
+      }),
+    }) as ReturnType<typeof ClaudeSdk.query>);
+    yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+    const initializedAt = DateTime.formatIso(yield* DateTime.now);
+    const pending = yield* probeClaudeCapabilities(decodeClaudeSettings({ binaryPath: "claude" })).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust("2 seconds");
+    const observedAt = DateTime.formatIso(yield* DateTime.now);
+    releaseUsage!();
+    const capabilities = yield* Fiber.join(pending);
+    assert.notEqual(observedAt, initializedAt);
+    assert.equal(capabilities?.usage?.observedAt, observedAt);
+    yield* TestClock.adjust("1 second");
+    assert.equal(capabilities?.usage?.observedAt, observedAt);
+    query.mockImplementation(() => ({
+      initializationResult: async () => ({ account: { tokenSource: "oauth" }, commands: [] }),
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({ rate_limits_available: true, rate_limits: {} }),
+    }) as ReturnType<typeof ClaudeSdk.query>);
+    const freshObservedAt = DateTime.formatIso(yield* DateTime.now);
+    const fresh = yield* probeClaudeCapabilities(decodeClaudeSettings({ binaryPath: "claude" }));
+    assert.equal(fresh?.usage?.observedAt, freshObservedAt);
+    assert.isAbove(Date.parse(fresh!.usage!.observedAt), Date.parse(observedAt));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

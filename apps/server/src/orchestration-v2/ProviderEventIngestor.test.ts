@@ -12,6 +12,7 @@ import {
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
   ProviderDriverKind,
@@ -242,6 +243,51 @@ it.effect("records accepted billed turn usage once without billing the context w
 });
 
 layer("ProviderEventIngestorV2", (it) => {
+  it.effect("native terminal assistant identity roundtrips the provider event and refuses a stale attempt overwrite", () =>
+    Effect.gen(function* () {
+      // Payload transport only; the native producer falsifier lives in the
+      // adapter replay suite and sends its actual output through this service.
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const thread = yield* threadCreatedEvent(now);
+      yield* eventSink.write({ events: [thread] });
+      const providerSessionId = yield* ids.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId, threadId: thread.threadId,
+      });
+      const providerTurn: OrchestrationV2ProviderTurn = {
+        id: ids.derive.providerTurn({ driver: CODEX_DRIVER, nativeTurnId: "certificate-turn" }),
+        providerThreadId: ids.derive.providerThread({ driver: CODEX_DRIVER, nativeThreadId: "native-thread" }),
+        nodeId: NodeId.make("certificate-root"), runAttemptId: RunAttemptId.make("certificate-attempt"),
+        nativeTurnRef: { driver: CODEX_DRIVER, nativeId: "certificate-turn", strength: "strong" },
+        ordinal: 1, status: "completed", startedAt: now, completedAt: now,
+        terminalAssistantMessageId: ids.derive.messageFromProviderItem({ driver: CODEX_DRIVER, nativeItemId: "final110" }),
+      };
+      const input = { providerSessionId, providerInstanceId: modelSelection.instanceId,
+        threadId: thread.threadId, event: { type: "provider_turn.updated" as const, driver: CODEX_DRIVER, providerTurn } };
+      yield* ingestor.ingestNormalized(input);
+      yield* ingestor.ingestNormalized(input);
+      const ignored = yield* ingestor.ingestNormalized({ ...input,
+        event: { ...input.event, providerTurn: { ...providerTurn,
+          terminalAssistantMessageId: MessageId.make("stale-commentary111") } },
+        writeIfRunCurrent: { runId: RunId.make("no-longer-current"),
+          activeAttemptId: RunAttemptId.make("stale-attempt"), expectedStatus: "running" },
+      });
+      assert.isEmpty(ignored);
+      const projection = yield* projections.getThreadProjection(thread.threadId);
+      assert.lengthOf(projection.providerTurns, 1);
+      assert.deepEqual(projection.providerTurns[0], providerTurn);
+      const stored = yield* eventStore.read({ threadId: thread.threadId,
+        eventType: "provider-turn.updated" }).pipe(Stream.runCollect);
+      assert.lengthOf(stored, 2);
+      assert.isTrue(stored.every(({ event }) => event.type === "provider-turn.updated" &&
+        event.payload.terminalAssistantMessageId === providerTurn.terminalAssistantMessageId));
+    }),
+  );
+
   it.effect("normalizes provider events through the real event log and projection store", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;

@@ -185,9 +185,17 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   t3_thread_configure: writesThread((input) =>
     Effect.gen(function* () {
       const {
+        scope,
         threads,
         projection: { thread },
       } = yield* readThread(input.threadId);
+      if (scope.thread?.threadId === thread.id) {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message:
+            "An active agent cannot configure its own thread because a selection change can interrupt the caller. Keep this run on its current selection. Use t3_thread_configuration to read it; an existing authorized controller can change the selection after this run finishes and explicitly continue the original thread if it remains eligible.",
+        });
+      }
       const type = modelSelectionCommandType(thread.providerInstanceId, input.modelSelection);
       const result = yield* threads
         .dispatch({
@@ -219,6 +227,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   t3_pending_request_respond: writesThread((input) =>
     Effect.gen(function* () {
       const { threads, projection } = yield* readQuestion(input);
+      for (const additional of input.additionalAnswers ?? []) {
+        yield* readQuestion({ threadId: projection.thread.id, requestId: additional.requestId });
+      }
       const result = yield* threads
         .dispatch({
           type: "runtime-request.respond",
@@ -226,6 +237,25 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           commandId: yield* newCommandId(),
           requestId: input.requestId,
           answers: input.answers,
+          createdBy: "agent",
+          creationSource: "mcp",
+          ...(input.additionalAnswers === undefined
+            ? {}
+            : { additionalAnswers: input.additionalAnswers }),
+        })
+        .pipe(Effect.mapError(dispatchFailure));
+      return { sequence: result.sequence };
+    }),
+  ),
+  t3_pending_request_dismiss: writesThread((input) =>
+    Effect.gen(function* () {
+      const { threads, projection } = yield* readQuestion(input);
+      const result = yield* threads
+        .dispatch({
+          type: "thread.user-input.dismiss",
+          threadId: projection.thread.id,
+          commandId: yield* newCommandId(),
+          requestId: input.requestId,
         })
         .pipe(Effect.mapError(dispatchFailure));
       return { sequence: result.sequence };

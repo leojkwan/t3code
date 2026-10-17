@@ -11,6 +11,7 @@ import {
   CheckpointId,
   CodexSettings,
   EnvironmentId,
+  EventId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -58,6 +59,12 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "../EffectWorker.ts";
+import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as EventSink from "../EventSink.ts";
+import * as EventStore from "../EventStore.ts";
+import * as ProjectionStore from "../ProjectionStore.ts";
+import * as ProviderEventIngestor from "../ProviderEventIngestor.ts";
+import * as ThreadCommandExecutor from "../ThreadCommandExecutor.ts";
 import * as Orchestrator from "../Orchestrator.ts";
 import * as ProviderReplayHarness from "../testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -2593,6 +2600,195 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ? [event.turnItem]
         : [],
     );
+
+  describe("native terminal assistant identity", () => {
+    const notification = (method: string, params: unknown): CodexReplay.CodexAppServerReplayEntry => ({
+      type: "emit_inbound", label: method, frame: { method, params },
+    });
+    const finalItem = (id: string, text = "Complete final") => ({
+      type: "agentMessage", id, text, phase: "final_answer", memoryCitation: null,
+    });
+    const barrier = (id: number, threadId: string): Array<CodexReplay.CodexAppServerReplayEntry> => [
+      { type: "expect_outbound", label: "read barrier", frame: {
+        id, method: "thread/goal/get", params: { threadId },
+      } },
+      { type: "emit_inbound", label: "read barrier", frame: { id, result: { goal: null } } },
+    ];
+    const terminalTurns = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+      events.flatMap((event) => event.type === "provider_turn.updated" &&
+        event.providerTurn.status !== "running" ? [event.providerTurn] : []);
+    const stores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
+      Layer.provide(SqlitePersistence.layerMemory),
+    );
+    const sink = EventSink.layer.pipe(
+      Layer.provide(Layer.mergeAll(stores, SqlitePersistence.layerMemory)),
+    );
+    const persistence = Layer.mergeAll(stores, sink, ProviderEventIngestor.layer.pipe(
+      Layer.provide(Layer.mergeAll(stores, sink, IdAllocator.layer, ThreadCommandExecutor.layer)),
+    ));
+
+    it.effect("certifies final110 before commentary111, joins original and steered inputs, persists and restarts", () =>
+      Effect.gen(function* () {
+        const scenario = "native-final110-commentary111";
+        const threadId = "native-final-thread";
+        const turnId = "native-final-turn";
+        const prompt = "Finish the original task";
+        const transcript = makeCodexReplayTranscript({ scenario, entries: [
+          ...codexReplayPreamble({ nativeThreadId: threadId, nativeTurnId: turnId, prompt }),
+          { type: "expect_outbound", label: "steer original run", frame: {
+            id: 4, method: "turn/steer", params: {
+              expectedTurnId: turnId, input: [{ type: "text", text: "Keep the original task" }], threadId,
+            },
+          } },
+          { type: "emit_inbound", label: "steer accepted", frame: { id: 4, result: { turnId } } },
+          notification("item/completed", { threadId, turnId, item: finalItem("final110") }),
+          notification("item/completed", { threadId, turnId, item: {
+            type: "agentMessage", id: "commentary111", text: "get the Resplit fixes to", phase: "commentary",
+          } }),
+          notification("item/completed", { threadId, turnId, item: finalItem("final110") }),
+          notification("turn/completed", { threadId, turn: makeCodexReplayTurn({ id: turnId, status: "completed" }) }),
+          notification("item/completed", { threadId, turnId, item: finalItem("late112", "Late callback") }),
+          notification("turn/completed", { threadId, turn: makeCodexReplayTurn({ id: turnId, status: "completed" }) }),
+          ...barrier(5, threadId),
+        ] });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const now = yield* DateTime.now;
+        const input = makeCodexTestTurnInput({ threadId: harness.threadId,
+          providerThread: harness.providerThread, now, attemptId: RunAttemptId.make("native-final-attempt"), text: prompt });
+        const steer = { ...input.message, messageId: MessageId.make("accepted-steer"), text: "Keep the original task" };
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const providerTurnId = ids.derive.providerTurn({ driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeTurnId: turnId });
+        yield* harness.runtime.startTurn(input);
+        yield* harness.runtime.steerTurn({ threadId: harness.threadId, runId: input.runId,
+          providerThread: harness.providerThread, providerTurnId, message: steer });
+        yield* harness.firstTerminal;
+        // A decoded RPC response behind the late notifications is an input-reader
+        // barrier; no sleep or inference from a midway event count.
+        yield* harness.runtime.readNativeGoal!({ providerThread: harness.providerThread });
+        const turns = terminalTurns(harness.events);
+        const finalId = ids.derive.messageFromProviderItem({ driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeItemId: "final110" });
+        assert.lengthOf(turns, 1);
+        assert.equal(turns[0]?.terminalAssistantMessageId, finalId);
+        assert.equal(turns[0]?.runAttemptId, input.attemptId);
+        assert.equal(turns[0]?.nodeId, input.rootNodeId);
+        const messages = assistantMessages(harness.events).map((event) => event.message);
+        assert.deepEqual(messages.map((message) => [message.id, message.text, message.runId, message.streaming]), [
+          [finalId, "Complete final", input.runId, false],
+          [ids.derive.messageFromProviderItem({ driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeItemId: "commentary111" }),
+            "get the Resplit fixes to", input.runId, false],
+        ]);
+        assert.lengthOf(harness.terminalEvents(), 1);
+        assert.isEmpty(harness.continuationRequests);
+
+        const eventSink = yield* EventSink.EventSinkV2;
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const providerSessionId = ProviderSessionId.make(`provider-session-${scenario}`);
+        yield* eventSink.write({ events: [
+          { id: EventId.make("native-final:thread"), type: "thread.created", threadId: harness.threadId,
+            occurredAt: now, payload: input.appThread },
+          { id: EventId.make("native-final:run"), type: "run.created", threadId: harness.threadId,
+            runId: input.runId, occurredAt: now, payload: {
+              id: input.runId, threadId: harness.threadId, ordinal: 1,
+              providerInstanceId: CODEX_TEST_MODEL_SELECTION.instanceId, modelSelection: CODEX_TEST_MODEL_SELECTION,
+              providerThreadId: harness.providerThread.id, userMessageId: input.message.messageId,
+              rootNodeId: input.rootNodeId, activeAttemptId: input.attemptId, status: "completed",
+              requestedAt: now, startedAt: now, completedAt: now, checkpointId: null, contextHandoffId: null,
+            } },
+          ...[input.message, steer].map((message) => ({
+            id: EventId.make(`native-final:${message.messageId}`), type: "message.updated" as const,
+            threadId: harness.threadId, runId: input.runId, occurredAt: now,
+            payload: { createdBy: message.createdBy, creationSource: message.creationSource,
+              id: message.messageId, threadId: harness.threadId, runId: input.runId, nodeId: null,
+              role: "user" as const, text: message.text, attachments: [], streaming: false, createdAt: now, updatedAt: now },
+          })),
+        ] });
+        // Ingest the actual decoded adapter output, including the certificate;
+        // the fixture never injects a public message phase or a guessed pointer.
+        for (const event of harness.events) yield* ingestor.ingestNormalized({
+          providerSessionId, providerInstanceId: CODEX_TEST_MODEL_SELECTION.instanceId,
+          threadId: harness.threadId, runId: input.runId, event,
+        });
+        const restarted = yield* ProjectionStore.ProjectionStoreV2.pipe(
+          Effect.provide(Layer.fresh(ProjectionStore.layer)),
+        );
+        for (const store of [projections, restarted]) {
+          const projection = yield* store.getThreadProjection(harness.threadId);
+          assert.equal(projection.providerTurns.find((turn) => turn.id === providerTurnId)?.terminalAssistantMessageId, finalId);
+          for (const accepted of [input.message, steer]) {
+            const owningRunId = projection.messages.find((message) => message.id === accepted.messageId)?.runId;
+            assert.equal(owningRunId, input.runId);
+            assert.equal(projection.runs.find((run) => run.id === owningRunId)?.activeAttemptId, turns[0]?.runAttemptId);
+          }
+          assert.equal(projection.messages.find((message) => message.id === finalId)?.runId, input.runId);
+          const finalMessage = projection.messages.find((message) => message.id === finalId);
+          const finalItem = projection.turnItems.find((item) => item.nodeId === finalMessage?.nodeId);
+          assert.equal(finalItem?.providerTurnId, providerTurnId);
+          assert.equal(finalItem?.providerThreadId, harness.providerThread.id);
+          assert.equal(finalItem?.nativeItemRef?.nativeId, "final110");
+          assert.deepEqual(projection.messages.filter((message) => message.role === "assistant"), messages);
+        }
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(
+        persistence, SqlitePersistence.layerMemory, IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer,
+      ))),
+    );
+
+    it.effect.each(["commentary", "null-phase", "omitted-phase", "buffered-only", "no-native-turn-complete",
+      "failed", "interrupted", "wrong-thread", "wrong-turn", "ambiguous", "ambiguous-same-text", "suppressed-final"] as const)(
+      "refuses %s without an unambiguous genuinely completed native final", (kind) => Effect.gen(function* () {
+        const threadId = `native-final-${kind}`;
+        const turnId = `native-turn-${kind}`;
+        const item = finalItem(`item-${kind}`);
+        const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [];
+        if (kind === "buffered-only") {
+          entries.push(notification("item/started", { threadId, turnId, item: { ...item, text: "" } }),
+            notification("item/agentMessage/delta", { threadId, turnId, itemId: item.id, delta: "Buffered final" }));
+        } else {
+          if (kind === "suppressed-final") entries.push(notification("item/completed", {
+            threadId, turnId, item: { type: "agentMessage", id: "legacy-item", text: item.text },
+          }));
+          const { phase: _phase, ...unknownItem } = item;
+          entries.push(notification("item/completed", {
+            threadId: kind === "wrong-thread" ? "foreign-thread" : threadId,
+            turnId: kind === "wrong-turn" ? "foreign-turn" : turnId,
+            item: kind === "commentary" ? { ...item, phase: "commentary" }
+              : kind === "null-phase" ? { ...item, phase: null }
+              : kind === "omitted-phase" ? unknownItem : item,
+          }));
+          if (kind === "ambiguous" || kind === "ambiguous-same-text") entries.push(notification("item/completed", {
+            threadId, turnId, item: finalItem("second-distinct-final", kind === "ambiguous-same-text" ? item.text : "Second final"),
+          }));
+        }
+        if (kind !== "no-native-turn-complete") {
+          // A wrong-thread terminal with the right turn ID must be ignored too.
+          if (kind === "wrong-thread") entries.push(notification("turn/completed", {
+            threadId: "foreign-thread", turn: makeCodexReplayTurn({ id: turnId, status: "completed" }),
+          }));
+          entries.push(notification("turn/completed", { threadId, turn: makeCodexReplayTurn({
+            id: turnId, status: kind === "failed" || kind === "interrupted" ? kind : "completed",
+          }) }));
+        }
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({ scenario: `final-refusal-${kind}`, entries: [
+          ...codexReplayPreamble({ nativeThreadId: threadId, nativeTurnId: turnId, prompt: "Original task" }),
+          ...entries, ...barrier(4, threadId),
+        ] }));
+        yield* harness.runtime.startTurn(makeCodexTestTurnInput({ threadId: harness.threadId,
+          providerThread: harness.providerThread, now: yield* DateTime.now,
+          attemptId: RunAttemptId.make(`final-refusal-${kind}`), text: "Original task" }));
+        yield* harness.runtime.readNativeGoal!({ providerThread: harness.providerThread });
+        yield* awaitUntil(() => kind === "no-native-turn-complete"
+          ? assistantMessages(harness.events).length === 1 : harness.terminalEvents().length === 1,
+          "native final identity refusal events");
+        assert.isTrue(terminalTurns(harness.events).every((turn) => turn.terminalAssistantMessageId == null));
+        assert.lengthOf(harness.terminalEvents(), kind === "no-native-turn-complete" ? 0 : 1);
+        if (kind === "buffered-only") assert.equal(assistantMessages(harness.events)[0]?.message.text, "Buffered final");
+        if (kind === "wrong-thread" || kind === "wrong-turn") assert.isEmpty(assistantMessages(harness.events));
+        assert.isEmpty(harness.continuationRequests);
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(
+        IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer,
+      ))),
+    );
+  });
 
   it.effect("keeps an asynchronous Codex question actionable after the turn completes", () =>
     Effect.scoped(
@@ -7479,7 +7675,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
-  it.effect("preserves a subagent result across a trailing empty final and resume", () =>
+  it.effect("native terminal assistant identity isolates parent from child finals, trailing empty final and resume", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const harness = yield* makeCodexReplayHarness(resumeSubagentTranscript);
@@ -7537,6 +7733,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
         assert.lengthOf(harness.terminalEvents(), 1);
         assert.lengthOf(harness.continuationRequests, 0);
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const rootTurnId = ids.derive.providerTurn({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeTurnId: RESUME_NATIVE_TURN,
+        });
+        const rootCertificates = harness.events.flatMap((event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.id === rootTurnId &&
+          event.providerTurn.status === "completed" ? [event.providerTurn.terminalAssistantMessageId] : []);
+        assert.deepEqual(rootCertificates, [ids.derive.messageFromProviderItem({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeItemId: "root-answer-resume",
+        })]);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -8323,6 +8529,176 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         event.type === "provider_thread.updated" ? [event.providerThread.goal?.status ?? null] : [],
       );
 
+    it.effect("reads actual account and backend ordinary-usage permission without refreshing or starting work", () =>
+      Effect.gen(function* () {
+        const account = { account: { type: "chatgpt", email: null, planType: "pro" }, requiresOpenaiAuth: true };
+        const usage = { accountId: "workspace:actual", ordinaryUsageAllowed: true,
+          rateLimits: { limitId: "codex", primary: { usedPercent: 0, windowDurationMins: 300 } },
+          rateLimitsByLimitId: { codex: { primary: { usedPercent: 0 } }, review: { primary: { usedPercent: 100 } } } };
+        const unknown = { ...usage, ordinaryUsageAllowed: null };
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: "native-account-admission-read-only", entries: [ ...sessionStart,
+            ...request(3, "account/read", { refreshToken: false }, account),
+            ...request(4, "account/rateLimits/read", null, usage),
+            ...request(5, "account/read", { refreshToken: false }, account),
+            ...request(6, "account/rateLimits/read", null, unknown),
+          ],
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const before = methods.length;
+        const first = yield* harness.runtime.readNativeAccount!({ providerThread: harness.providerThread });
+        assert.deepEqual(first.account, account);
+        assert.deepEqual(first.rateLimits, usage);
+        assert.isAtLeast(first.usageObservedAtMs, first.accountObservedAtMs);
+        const second = yield* harness.runtime.readNativeAccount!({ providerThread: harness.providerThread });
+        // Native null remains unknown even when every ordinary percentage is zero.
+        assert.deepEqual(second.rateLimits, unknown);
+        assert.deepEqual(methods.slice(before), ["account/read", "account/rateLimits/read", "account/read", "account/rateLimits/read"]);
+        assert.deepEqual(harness.continuationRequests, []);
+        assert.deepEqual(harness.terminalEvents(), []);
+      }),
+    );
+
+    it.effect("rejects an account read for another runtime before any native request", () =>
+      Effect.gen(function* () {
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: "native-account-read-foreign-session", entries: sessionStart,
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const before = [...methods];
+        const result = yield* harness.runtime.readNativeAccount!({ providerThread: {
+          ...harness.providerThread, providerSessionId: ProviderSessionId.make("foreign-session"),
+        } }).pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.deepEqual(methods, before);
+      }),
+    );
+
+    it.effect("rejects malformed native ordinary-usage permission through the SDK decoder", () =>
+      Effect.gen(function* () {
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: "native-account-read-malformed", entries: [ ...sessionStart,
+            ...request(3, "account/read", { refreshToken: false }, {
+              account: { type: "chatgpt", email: null, planType: "pro" }, requiresOpenaiAuth: true,
+            }),
+            ...request(4, "account/rateLimits/read", null, {
+              accountId: "workspace:actual", ordinaryUsageAllowed: "yes", rateLimits: {},
+            }),
+          ],
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const before = methods.length;
+        assert.equal((yield* harness.runtime.readNativeAccount!({ providerThread: harness.providerThread })
+          .pipe(Effect.result))._tag, "Failure");
+        assert.deepEqual(methods.slice(before), ["account/read", "account/rateLimits/read"]);
+        assert.deepEqual(harness.continuationRequests, []);
+      }),
+    );
+
+    it.effect("reads changed native goal authority from the resident session without any turn, resume or goal mutation", () =>
+      Effect.gen(function* () {
+        const first = { ...codexGoal("active", 120), tokenBudget: 1000 };
+        const changed = { ...first, objective: "Changed native objective", tokensUsed: 240,
+          timeUsedSeconds: 9, updatedAt: first.updatedAt + 6 };
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: "native-goal-read-only", entries: [ ...sessionStart,
+            ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal: first }),
+            ...request(4, "thread/goal/get", { threadId: nativeThreadId }, { goal: changed }),
+          ],
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const before = [...methods];
+        const staleProviderThread = { ...harness.providerThread,
+          goal: { objective: "Stale display projection", status: "paused" as const, tokensUsed: 9999, tokenBudget: null },
+        };
+        const read = harness.runtime.readNativeGoal;
+        assert.isDefined(read);
+        assert.deepEqual(yield* read!({ providerThread: staleProviderThread }), first);
+        assert.deepEqual(yield* read!({ providerThread: staleProviderThread }), changed);
+        assert.deepEqual(methods.slice(before.length), ["thread/goal/get", "thread/goal/get"]);
+        assert.deepEqual(harness.continuationRequests, []);
+        assert.deepEqual(harness.terminalEvents(), []);
+        assert.deepEqual(staleProviderThread.goal, { objective: "Stale display projection", status: "paused", tokensUsed: 9999, tokenBudget: null });
+      }),
+    );
+
+    it.effect.each(["absent-budget", "null-budget", "no-goal", "paused"] as const)(
+      "preserves %s raw native read without display conversion or work", (kind) => Effect.gen(function* () {
+        const { tokenBudget: _budget, ...withoutBudget } = codexGoal("active", 25);
+        const goal = kind === "no-goal" ? null : kind === "absent-budget" ? withoutBudget
+          : kind === "paused" ? codexGoal("paused", 25) : codexGoal("active", 25);
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: `native-goal-read-${kind}`, entries: [ ...sessionStart,
+            ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal }),
+          ],
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const count = methods.length;
+        const result = yield* harness.runtime.readNativeGoal!({ providerThread: harness.providerThread });
+        assert.deepEqual(result, goal);
+        if (kind === "absent-budget") assert.isFalse(Object.hasOwn(result!, "tokenBudget"));
+        assert.deepEqual(methods.slice(count), ["thread/goal/get"]);
+        assert.deepEqual(harness.continuationRequests, []);
+        assert.deepEqual(harness.terminalEvents(), []);
+      }),
+    );
+
+    it.effect.each(["wrong-thread", "malformed"] as const)(
+      "refuses %s native authority through the actual typed SDK read", (kind) => Effect.gen(function* () {
+        const goal = kind === "wrong-thread" ? { ...codexGoal("active", 25), threadId: "foreign-native-thread" }
+          : { ...codexGoal("active", 25), tokensUsed: "not-a-number" };
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: `native-goal-read-refuse-${kind}`, entries: [ ...sessionStart,
+            ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal }),
+          ],
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const count = methods.length;
+        assert.equal((yield* harness.runtime.readNativeGoal!({ providerThread: harness.providerThread }).pipe(Effect.result))._tag, "Failure");
+        assert.deepEqual(methods.slice(count), ["thread/goal/get"]);
+        assert.deepEqual(harness.continuationRequests, []);
+        assert.deepEqual(harness.terminalEvents(), []);
+      }),
+    );
+
+    it.effect("refuses a foreign native-session binding before any native request", () =>
+      Effect.gen(function* () {
+        const methods: string[] = [];
+        const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+          scenario: "native-goal-read-foreign-session", entries: sessionStart,
+        }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+        const count = methods.length;
+        assert.equal((yield* harness.runtime.readNativeGoal!({ providerThread: {
+          ...harness.providerThread, providerSessionId: ProviderSessionId.make("foreign-session"),
+        } }).pipe(Effect.result))._tag, "Failure");
+        assert.equal(methods.length, count);
+      }),
+    );
+
+    it.effect.each(["/goal Ship the feature", "/goal resume", "/goal clear"])(
+      "preserves accounting when original %s loses its native transport before mutation", (text) =>
+        Effect.gen(function* () {
+          const methods: string[] = [];
+          const harness = yield* makeCodexReplayHarness(makeCodexReplayTranscript({
+            scenario: `native-goal-original-transport-${encodeURIComponent(text)}`, entries: [ ...sessionStart,
+              { type: "expect_outbound", label: "original goal read", frame: {
+                id: 3, method: "thread/goal/get", params: { threadId: nativeThreadId },
+              } },
+              { type: "runtime_exit", status: "error", error: "Original native transport lost." },
+            ],
+          }), undefined, (method) => Effect.sync(() => { methods.push(method); }));
+          const baseline = methods.length;
+          assert.equal((yield* harness.runtime.startTurn(yield* goalTurnInput(harness, text))
+            .pipe(Effect.result))._tag, "Failure");
+          assert.deepEqual(methods.slice(baseline), ["thread/goal/get"]);
+          assert.isFalse(methods.some((method) => ["thread/goal/set", "thread/goal/clear", "thread/resume", "turn/start"].includes(method)));
+          assert.deepEqual(harness.continuationRequests, []);
+          // The canonical original-input recovery regression refuses this stored
+          // command before outbox commit. This adapter test proves the actual SDK
+          // failure/call trace, not a direct automatic retry or installed recovery.
+        }),
+    );
+
     it("parses /goal like the Codex TUI", () => {
       assert.deepEqual(CodexAdapterV2.parseCodexGoalCommand("/goal"), { type: "show" });
       assert.deepEqual(CodexAdapterV2.parseCodexGoalCommand(" /goal Pause "), { type: "pause" });
@@ -8336,7 +8712,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isNull(CodexAdapterV2.parseCodexGoalCommand("set a /goal"));
     });
 
-    it.effect("keeps a /goal run open across the turns Codex continues on its own", () =>
+    it.effect("native terminal assistant identity keeps a /goal run open across native turns", () =>
       Effect.gen(function* () {
         const transcript = makeCodexReplayTranscript({
           scenario: "goal-continuation",
@@ -8368,6 +8744,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               threadId: nativeThreadId,
               turnId: "goal-turn-1",
               goal: codexGoal("active", 0),
+            }),
+            notification("goal phase final", "item/completed", {
+              threadId: nativeThreadId, turnId: "goal-turn-1",
+              item: { type: "agentMessage", id: "goal-phase-final", text: "Phase one", phase: "final_answer" },
             }),
             notification("first turn done", "turn/completed", {
               threadId: nativeThreadId,
@@ -8420,6 +8800,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ],
         );
         assert.equal(providerGoals(harness.events).at(-1), "complete");
+        const firstTurn = harness.events.find((event) => event.type === "provider_turn.updated" &&
+          event.providerTurn.id === providerTurnId("goal-turn-1") && event.providerTurn.status === "completed");
+        assert.equal(firstTurn?.type === "provider_turn.updated" && firstTurn.providerTurn.terminalAssistantMessageId,
+          idAllocator.derive.messageFromProviderItem({ driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeItemId: "goal-phase-final" }));
+        assert.isFalse(harness.terminalEvents().some((event) => event.providerTurnId === providerTurnId("goal-turn-1")),
+          "A certified native phase must not terminate the still-active goal run");
       }).pipe(
         Effect.scoped,
         Effect.provide(

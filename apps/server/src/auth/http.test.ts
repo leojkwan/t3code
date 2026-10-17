@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthSessionId,
+  AuthAdministrativeScopes,
   AuthTokenExchangeGrantType,
   AuthEnvironmentBootstrapTokenType,
   AuthAccessTokenType,
@@ -74,6 +75,50 @@ const postJson = (path: string, body: unknown, headers?: Readonly<Record<string,
     headers: { "content-type": "application/json", ...headers },
     body: encodeJson(body),
   });
+
+it.effect("classifies an existing session through access-write CAS without issuing credentials and refuses automation administration", () =>
+  Effect.gen(function* () {
+    const context = Context.make(Crypto.Crypto, yield* Crypto.Crypto);
+    return yield* Effect.acquireUseRelease(
+      Effect.sync(() => HttpRouter.toWebHandler(layerRoutes, { disableLogger: true })),
+      (server) => Effect.tryPromise(async () => {
+        const login = await server.handler(postJson("/api/auth/browser-session", { credential: DEV_TOKEN }), context);
+        const adminCookie = login.headers.getSetCookie().find((cookie) => cookie.startsWith("t3_dev_session_"))!.split(";", 1)[0]!;
+        const pairing = await server.handler(postJson("/api/auth/pairing-token", {
+          scopes: AuthAdministrativeScopes,
+        }, { cookie: adminCookie }), context);
+        const targetLogin = await server.handler(postJson("/api/auth/browser-session", {
+          credential: (await pairing.json() as { credential: string }).credential,
+        }), context);
+        const targetCookie = targetLogin.headers.getSetCookie().find((cookie) => cookie.startsWith("t3_session_"))!.split(";", 1)[0]!;
+        const currentResponse = await server.handler(new Request("http://127.0.0.1/api/auth/clients", {
+          headers: { cookie: targetCookie },
+        }), context);
+        const before = await currentResponse.json() as Array<{ sessionId: string; current: boolean; purpose?: string | null }>;
+        const target = before.find((row) => row.current)!;
+        const payload = { sessionId: target.sessionId, expectedPurpose: null, purpose: "automation" };
+        const classify = await server.handler(postJson("/api/auth/clients/classify", payload, { cookie: adminCookie }), context);
+        expect(classify.status).toBe(200);
+        expect(await classify.json()).toEqual({ changed: true });
+        expect(classify.headers.getSetCookie()).toHaveLength(0);
+        const duplicate = await server.handler(postJson("/api/auth/clients/classify", payload, { cookie: adminCookie }), context);
+        expect(await duplicate.json()).toEqual({ changed: false });
+        const afterResponse = await server.handler(new Request("http://127.0.0.1/api/auth/clients", {
+          headers: { cookie: targetCookie },
+        }), context);
+        const after = await afterResponse.json() as typeof before;
+        expect(after.map((row) => row.sessionId).sort()).toEqual(before.map((row) => row.sessionId).sort());
+        expect(after.find((row) => row.current)).toMatchObject({ sessionId: target.sessionId, purpose: "automation" });
+        const refused = await server.handler(postJson("/api/auth/clients/classify", {
+          sessionId: target.sessionId, expectedPurpose: "automation", purpose: "human",
+        }, { cookie: targetCookie }), context);
+        expect(refused.status).toBe(403);
+        expect(await refused.json()).toMatchObject({ reason: "automation_session_classification_not_allowed" });
+      }),
+      (server) => Effect.promise(() => server.dispose()),
+    );
+  }).pipe(Effect.scoped),
+);
 
 it.effect("sets the selected browser session cookies through the HTTP route", () =>
   Effect.gen(function* () {

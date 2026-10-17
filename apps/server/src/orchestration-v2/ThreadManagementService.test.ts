@@ -8,6 +8,7 @@ import {
   type OrchestrationV2Subagent,
   type OrchestrationV2ProviderThread,
   ProviderThreadId,
+  RuntimeRequestId,
   ProviderDriverKind,
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
@@ -962,3 +963,17 @@ it.effect.each([
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
   }),
 );
+
+it("stamps issuer-classified automation including async answers while preserving legacy human provenance", () => {
+  const answer: OrchestrationV2Command = {
+    type: "runtime-request.respond", commandId: CommandId.make("purpose-answer"), threadId: ThreadId.make("purpose-thread"),
+    requestId: RuntimeRequestId.make("purpose-request"), answers: { color: "Blue" }, createdBy: "user", creationSource: "web",
+  };
+  const agent = ThreadManagementService.withCreationProvenance(answer,
+    ThreadManagementService.authenticatedCreationProvenance("automation", answer));
+  expect(agent).toMatchObject({ createdBy: "agent", creationSource: "server", answers: answer.answers });
+  for (const purpose of ["human", null, undefined] as const) {
+    expect(ThreadManagementService.withCreationProvenance(answer,
+      ThreadManagementService.authenticatedCreationProvenance(purpose, answer))).toMatchObject({ createdBy: "user", creationSource: "web" });
+  }
+});

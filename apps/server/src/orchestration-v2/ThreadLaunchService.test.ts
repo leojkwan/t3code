@@ -52,6 +52,8 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as PersistenceErrors from "../persistence/Errors.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -239,6 +241,7 @@ function makeHarness(options: HarnessOptions = {}) {
       layerLaunch,
       layerThreadManagement,
       layerTitleRegeneration,
+      layerReceipts,
       layerOutbox,
       layerDatabase,
       layerExternalServices,
@@ -1985,6 +1988,9 @@ it.effect("bounds concurrent first launches to one thread per command", () =>
       const winner = results.find(Exit.isSuccess);
       assert.isDefined(winner);
       const threadId = winner!.value.threadId;
+      assert.deepEqual(yield* launches.getLaunchReceipt(rest.commandId), {
+        type: "accepted", commandId: rest.commandId, threadId, projectId,
+      });
       for (const result of results) {
         if (Exit.isSuccess(result)) {
           assert.equal(result.value.threadId, threadId);
@@ -2261,6 +2267,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
               }),
             ),
           ),
+        getLaunchReceipt: launches.getLaunchReceipt,
         checkWorktreeBase: launches.checkWorktreeBase,
         retryPreparation: launches.retryPreparation,
       }),
@@ -2704,4 +2711,110 @@ it.effect("replays an accepted message.dispatch after the project disables the i
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+});
+
+
+it.effect("reads an old server-allocated launch key without another launch or provider work even with exhausted usage", () => {
+  const exhausted = {
+    instanceId: modelSelection.instanceId, driver: ProviderDriverKind.make("codex"),
+    enabled: true, installed: true, version: null, status: "ready", auth: { status: "authenticated" },
+    checkedAt: "2026-10-11T00:00:00.000Z", models: [], slashCommands: [], skills: [],
+    usageLimits: { checkedAt: "2026-10-11T00:00:00.000Z", windows: [
+      { id: "primary", kind: "session", label: "Session", usedPercent: 100 },
+    ] },
+  } satisfies ServerProvider;
+  const harness = makeHarness({ providers: [exhausted] });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const { threadId: _omitted, ...input } = launchInput({ command: "legacy-allocated-key", thread: "unused" });
+    const first = yield* launches.launch(input);
+    const before = yield* threads.getThreadProjection(first.threadId);
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const beforeEffects = yield* outbox.listByCommandId(input.commandId);
+    for (let read = 0; read < 2; read++) {
+      assert.deepEqual(yield* launches.getLaunchReceipt(input.commandId), {
+        type: "accepted", commandId: input.commandId, threadId: first.threadId, projectId,
+      });
+    }
+    const after = yield* threads.getThreadProjection(first.threadId);
+    assert.deepEqual(after.messages, before.messages);
+    assert.deepEqual(after.runs, before.runs);
+    assert.deepEqual(yield* outbox.listByCommandId(input.commandId), beforeEffects);
+    assert.equal(beforeEffects.filter((effect) => effect.request.type === "provider-turn.start").length, 0);
+    assert.equal((yield* threads.listProjectThreads({ projectId, includeSubagents: false })).length, 1);
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+    assert.equal(harness.runSetup.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("distinguishes an unused launch key from project, wrong-command, rejected and malformed receipts without effects", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const missing = CommandId.make("launch-read-missing");
+    assert.deepEqual(yield* launches.getLaunchReceipt(missing), { type: "no_receipt", commandId: missing });
+    const acceptedAt = yield* DateTime.now;
+    for (const [key, commandType, status, error, reason] of [
+      ["wrong-kind", "message.dispatch", "accepted", null, "wrong_command_kind"],
+      ["rejected", "thread.create", "rejected", "Refused", "not_accepted"],
+      ["malformed", "thread.create", "accepted", "Unexpected accepted error", "malformed_receipt"],
+    ] as const) {
+      const commandId = CommandId.make(`launch-read-${key}`);
+      yield* receipts.upsert({ commandId, threadId: ThreadId.make("original-thread"), commandType,
+        acceptedAt, resultSequence: 0, status, error });
+      assert.equal((yield* launches.getLaunchReceipt(commandId).pipe(Effect.flip)).reason, reason);
+    }
+    const projectCommand = CommandId.make("launch-read-project");
+    yield* receipts.upsert({ commandId: projectCommand, projectId, commandType: "project.create",
+      acceptedAt, resultSequence: 0, status: "accepted", error: null });
+    assert.equal((yield* launches.getLaunchReceipt(projectCommand).pipe(Effect.flip)).reason, "wrong_command_kind");
+    assert.equal((yield* threads.listProjectThreads({ projectId, includeSubagents: false })).length, 0);
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+    assert.equal(harness.runSetup.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("keeps database and decoded-receipt faults distinct from absence", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    const commandId = CommandId.make("launch-read-fault");
+    const decodeFailure = yield* Schema.decodeUnknownEffect(CommandReceiptStore.CommandReceiptV2)({}).pipe(Effect.flip);
+    const spy = vi.spyOn(receipts, "getByCommandId");
+    yield* Effect.gen(function* () {
+      spy.mockReturnValue(Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId,
+        cause: new PersistenceErrors.PersistenceSqlError({ operation: "receipt.read", cause: new Error("database unavailable") }),
+      })));
+      assert.equal((yield* launches.getLaunchReceipt(commandId).pipe(Effect.flip)).reason, "read_failed");
+      spy.mockReturnValue(Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId,
+        cause: new PersistenceErrors.PersistenceSqlError({ operation: "receipt.read", cause: decodeFailure }),
+      })));
+      assert.equal((yield* launches.getLaunchReceipt(commandId).pipe(Effect.flip)).reason, "malformed_receipt");
+    }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+  }).pipe(Effect.provide(harness.layer));
+});
+
+
+it.effect("keeps a retained canonical id when its shell is absent and refuses a shell read fault", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const commandId = CommandId.make("launch-read-retained-id");
+    const threadId = ThreadId.make("retained-absent-shell");
+    yield* receipts.upsert({ commandId, threadId, commandType: "thread.create", acceptedAt: yield* DateTime.now,
+      resultSequence: 0, status: "accepted", error: null });
+    assert.deepEqual(yield* launches.getLaunchReceipt(commandId), { type: "accepted", commandId, threadId });
+    const spy = vi.spyOn(threads, "getThreadShell").mockReturnValue(
+      Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId, cause: "fixture read fault" })),
+    );
+    yield* Effect.gen(function* () {
+      assert.equal((yield* launches.getLaunchReceipt(commandId).pipe(Effect.flip)).reason, "thread_read_failed");
+    }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+  }).pipe(Effect.provide(harness.layer));
 });

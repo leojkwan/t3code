@@ -513,6 +513,25 @@ export const layer = HttpApiBuilder.group(
         ),
       )
       .handle(
+        "classifyClient",
+        Effect.fn("environment.auth.classifyClient")(
+          function* (args) {
+            yield* annotateEnvironmentRequest(args.endpoint.name);
+            const session = yield* requireEnvironmentScope(AuthAccessWriteScope);
+            if (session.purpose === "automation") {
+              return yield* failEnvironmentOperationForbidden("automation_session_classification_not_allowed");
+            }
+            const changed = yield* serverAuth.classifyClientSession(
+              { sessionId: session.sessionId, purpose: session.purpose ?? null }, args.payload,
+            );
+            return { changed };
+          },
+          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+            failEnvironmentInternal("client_session_classification_failed", error),
+          ),
+        ),
+      )
+      .handle(
         "revokeOtherClients",
         Effect.fn("environment.auth.revokeOtherClients")(
           function* (args) {

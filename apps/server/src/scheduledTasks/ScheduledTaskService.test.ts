@@ -3,7 +3,7 @@ import * as NodeUtil from "node:util";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
-import { ScheduledTaskError } from "@t3tools/contracts";
+import { AuthSessionId, ScheduledTaskError } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -20,8 +20,24 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
+
+// The two preexisting poll/SQL tests below exercise scheduler mechanics with
+// mocked dispatchers. This explicit test boundary is NOT a positive native
+// SID/Shadow/resource authority fixture or a production host Layer.
+const layerSchedulerMechanics = ScheduledTaskService.layer.pipe(Layer.provide(Layer.mergeAll(
+  Layer.succeed(RpcAuthorization.OriginalTaskRecoveryAdmission, {
+    withAdmission: (_target, use) => use,
+    withScheduledTaskAdmission: (_target, use) => use({
+      session: { sessionId: AuthSessionId.make("scheduler-mechanics-fixture"), purpose: "human" },
+      expectedAccountId: "not-a-native-account-proof",
+    }),
+  }),
+  Layer.mock(SessionStore.SessionStore)({ withCurrentAuthorization: (_session, use) => use }),
+)));
 
 const insertRow = (
   sql: SqlClient.SqlClient,
@@ -57,6 +73,57 @@ const insertRow = (
     last_run_error: null,
     run_count: 0,
   })}`;
+
+it.effect.each(["missing", "fault", "changed-task"] as const)(
+  "scheduled fire with %s native binding produces no dispatch and preserves the original task", (kind) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-09-09T12:00:00.000Z";
+      yield* insertRow(sql, { id: "guarded-original", next: now, enabled: 1, status: "never" }, now);
+      yield* TestClock.setTime(Date.parse(now) + 1000);
+      const before = yield* sql`SELECT * FROM scheduled_tasks WHERE task_id = 'guarded-original'`;
+      let tick: Effect.Effect<void> = Effect.die("scheduler did not register");
+      const dispatches: string[] = [];
+      const dependencies = Layer.mergeAll(
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({ launch: () =>
+          Effect.sync(() => { dispatches.push("launch"); }).pipe(
+            Effect.andThen(Effect.die("native binding must refuse before launch")),
+          ) }),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({ sendToThread: () => Effect.die("unexpected send") }),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        NodeCrypto.layer,
+        Layer.mock(Scheduler.Scheduler)({ register: Effect.fn(function* <E, R>(
+          _name: string, work: Effect.Effect<void, E, R>,
+        ) {
+          const context = yield* Effect.context<R>();
+          tick = work.pipe(Effect.provideContext(context), Effect.catchCause(Effect.die));
+        }) }),
+      );
+      const admission = RpcAuthorization.OriginalTaskRecoveryAdmission.of({
+        withAdmission: (_target, use) => use,
+        withScheduledTaskAdmission: (_target, use) => kind === "fault"
+          ? Effect.fail(new RpcAuthorization.ScheduledTaskAdmissionRefused({ reason: "scheduled_binding_unavailable" }))
+          : sql`UPDATE scheduled_tasks SET prompt = 'changed during native read' WHERE task_id = 'guarded-original'`
+            .pipe(Effect.andThen(use({ session: {
+              sessionId: AuthSessionId.make("source-only-guard-fixture"), purpose: "human",
+            }, expectedAccountId: "not-a-native-account-proof" }))),
+      });
+      const nativeLayer = kind === "missing" ? Layer.empty : Layer.mergeAll(
+        Layer.succeed(RpcAuthorization.OriginalTaskRecoveryAdmission, admission),
+        Layer.mock(SessionStore.SessionStore)({ withCurrentAuthorization: (_session, use) => use }),
+      );
+      yield* Effect.gen(function* () {
+        yield* ScheduledTaskService.ScheduledTaskService;
+        yield* tick;
+        assert.deepEqual(dispatches, []);
+        const after = yield* sql`SELECT * FROM scheduled_tasks WHERE task_id = 'guarded-original'`;
+        assert.deepEqual(after, kind === "changed-task"
+          ? before.map((row) => ({ ...row, prompt: "changed during native read" })) : before);
+      }).pipe(Effect.scoped, Effect.provide(ScheduledTaskService.layer.pipe(
+        Layer.provide(Layer.merge(dependencies, nativeLayer)),
+      )));
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
 
 it.effect("loads only due tasks and skips corrupt due rows without decoding settled tasks", () =>
   Effect.gen(function* () {
@@ -196,7 +263,7 @@ it.effect(
         Effect.gen(function* () {
           yield* Layer.build(
             Layer.provideMerge(
-              ScheduledTaskService.layer,
+              layerSchedulerMechanics,
               Layer.mergeAll(
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                   launch: () =>
@@ -294,7 +361,7 @@ it.effect(
         Effect.gen(function* () {
           yield* Layer.build(
             Layer.provideMerge(
-              ScheduledTaskService.layer,
+              layerSchedulerMechanics,
               Layer.mergeAll(
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                   launch: () =>

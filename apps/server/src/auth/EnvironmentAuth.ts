@@ -11,12 +11,14 @@ import {
   type AuthBrowserSessionResult,
   type AuthClientMetadata,
   type AuthClientSession,
+  type AuthClassifyClientSessionInput,
   type AuthCreatePairingCredentialInput,
   type AuthEnvironmentScope,
   type AuthMcpClientAccess,
   type AuthPairingLink,
   type AuthPairingCredentialResult,
   type AuthSessionId,
+  type AuthSessionPurpose,
   type AuthSessionState,
   authScopeResponse,
   type ServerAuthDescriptor,
@@ -106,6 +108,7 @@ export interface McpClientSession {
 
 export interface AuthenticatedSession {
   readonly sessionId: AuthSessionId;
+  readonly purpose?: AuthSessionPurpose | null;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
@@ -538,6 +541,10 @@ export class EnvironmentAuth extends Context.Service<
     readonly listClientSessions: (
       currentSessionId: AuthSessionId,
     ) => Effect.Effect<ReadonlyArray<AuthClientSession>, ServerAuthInternalError>;
+    readonly classifyClientSession: (
+      administrator: SessionStore.SessionAuthorization,
+      input: AuthClassifyClientSessionInput,
+    ) => Effect.Effect<boolean, ServerAuthInternalError>;
     readonly revokeClientSession: (
       currentSessionId: AuthSessionId,
       targetSessionId: AuthSessionId,
@@ -718,6 +725,7 @@ export const make = Effect.gen(function* () {
       Effect.flatMap(rejectMcpClientAudience),
       Effect.map((session) => ({
         sessionId: session.sessionId,
+        purpose: session.purpose ?? null,
         subject: session.subject,
         method: session.method,
         scopes: session.scopes,
@@ -1145,6 +1153,11 @@ export const make = Effect.gen(function* () {
     return yield* revokeSession(targetSessionId);
   });
 
+  const classifyClientSession: EnvironmentAuth["Service"]["classifyClientSession"] =
+    (administrator, input) => sessions.classify(administrator, input).pipe(
+      Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+    );
+
   const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = (
     currentSessionId,
   ) =>
@@ -1193,6 +1206,7 @@ export const make = Effect.gen(function* () {
             Effect.flatMap(rejectMcpClientAudience),
             Effect.map((session) => ({
               sessionId: session.sessionId,
+              purpose: session.purpose ?? null,
               subject: session.subject,
               method: session.method,
               scopes: session.scopes,
@@ -1301,6 +1315,7 @@ export const make = Effect.gen(function* () {
     revokeOtherSessionsExcept,
     listClientSessions,
     revokeClientSession,
+    classifyClientSession,
     revokeOtherClientSessions,
     authenticateHttpRequest,
     authenticateWebSocketUpgrade,

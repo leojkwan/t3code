@@ -89,6 +89,8 @@ function layerExecutorFor(input: {
     Layer.succeed(
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
+        readNativeAccount: () => Effect.die("unused native account read"),
+        readNativeGoal: () => Effect.die("unused native goal read"),
         interrupt: input.interrupt ?? (() => Effect.void),
         steer: () => Effect.void,
         interruptAndAwaitTerminal: (request) =>
@@ -160,6 +162,18 @@ function layerExecutorFor(input: {
     ),
   );
 }
+
+it("does not retry a named missing scheduled authority binding or swallow unrelated start faults", () => {
+  assert.isTrue(EffectWorker.isNonRetryableProviderTurnControlFailure(
+    "provider-turn.start", "ScheduledTaskAdmissionRefused: scheduled_binding_unavailable",
+  ));
+  assert.isFalse(EffectWorker.isNonRetryableProviderTurnControlFailure(
+    "provider-turn.start", "ordinary provider error",
+  ));
+  assert.isFalse(EffectWorker.isNonRetryableProviderTurnControlFailure(
+    "provider-turn.restart", "ScheduledTaskAdmissionRefused: scheduled_binding_unavailable",
+  ));
+});
 
 it("does not retry pure interrupt races where the turn is already gone", () => {
   assert.isTrue(

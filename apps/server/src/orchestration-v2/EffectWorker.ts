@@ -51,6 +51,9 @@ export function isNonRetryableProviderTurnControlFailure(
   effectType: string,
   errorText: string,
 ): boolean {
+  // An absent native schedule binding is an admission refusal, not a
+  // transient provider failure to retry under the same claimed effect.
+  if (effectType === "provider-turn.start" && /ScheduledTaskAdmissionRefused/.test(errorText)) return true;
   if (effectType !== "provider-turn.interrupt") {
     return false;
   }
@@ -151,7 +154,7 @@ export const layerExecutor: Layer.Layer<
               );
           case "provider-turn.start":
             return providerTurnStart
-              .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
+              .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry, effectId: effect.id })
               .pipe(
                 Effect.mapError(
                   (cause) =>

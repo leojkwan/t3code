@@ -1391,10 +1391,25 @@ function secretRequestAsPendingInput(
     nativeRequestRef: null,
     kind: "user_input",
     status: "pending",
-    responseCapability: { type: "message" },
+    responseCapability: {
+      type: "not_resumable",
+      reason: "Use secure entry to answer this secret request.",
+    },
     createdAt: item.startedAt ?? item.updatedAt,
     resolvedAt: null,
   };
+}
+
+function comparePendingRuntimeRequests(
+  left: OrchestrationV2ThreadProjection["runtimeRequests"][number],
+  right: OrchestrationV2ThreadProjection["runtimeRequests"][number],
+): number {
+  return (
+    Number(left.responseCapability.type === "message") -
+      Number(right.responseCapability.type === "message") ||
+    DateTime.toEpochMillis(right.createdAt) - DateTime.toEpochMillis(left.createdAt) ||
+    right.id.localeCompare(left.id)
+  );
 }
 
 export function threadShellFromProjection(
@@ -1422,27 +1437,25 @@ export function threadShellFromProjection(
       .filter(isActivityRunForShell)
       .toSorted((left, right) => right.ordinal - left.ordinal)[0] ?? null;
   const liveRunIds = new Set(projection.runs.filter(isActivityRunForShell).map((run) => run.id));
-  const pendingRuntimeRequest =
-    projection.runtimeRequests
-      .filter((request) => request.status === "pending")
+  const pendingSecret = secretRequestAsPendingInput(
+    projection.turnItems
+      .filter(
+        (item) =>
+          item.type === "secret_request" &&
+          item.status === "waiting" &&
+          item.runId !== null &&
+          liveRunIds.has(item.runId),
+      )
       .toSorted(
         (left, right) =>
-          DateTime.toEpochMillis(right.createdAt) - DateTime.toEpochMillis(left.createdAt),
-      )[0] ??
-    secretRequestAsPendingInput(
-      projection.turnItems
-        .filter(
-          (item) =>
-            item.type === "secret_request" &&
-            item.status === "waiting" &&
-            item.runId !== null &&
-            liveRunIds.has(item.runId),
-        )
-        .toSorted(
-          (left, right) =>
-            DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-        )[0] ?? null,
-    );
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+      )[0] ?? null,
+  );
+  const pendingRuntimeRequest =
+    [
+      ...projection.runtimeRequests.filter((request) => request.status === "pending"),
+      ...(pendingSecret === null ? [] : [pendingSecret]),
+    ].toSorted(comparePendingRuntimeRequests)[0] ?? null;
   const userMessages = projection.messages
     .filter((message) => message.role === "user")
     .toSorted(
@@ -1505,6 +1518,7 @@ export function threadShellFromProjection(
         : {
             id: pendingRuntimeRequest.id,
             kind: pendingRuntimeRequest.kind,
+            responseCapability: pendingRuntimeRequest.responseCapability,
             createdAt: pendingRuntimeRequest.createdAt,
           },
     // Thread detail owns message bodies. Keeping them out of shell rows makes
@@ -1771,6 +1785,7 @@ function shellFromState(input: {
         : {
             id: input.state.pendingRuntimeRequest.id,
             kind: input.state.pendingRuntimeRequest.kind,
+            responseCapability: input.state.pendingRuntimeRequest.responseCapability,
             createdAt: input.state.pendingRuntimeRequest.createdAt,
           },
     latestVisibleMessage: null,
@@ -5244,7 +5259,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 FROM orchestration_v2_projection_runtime_requests request
                 WHERE request.thread_id = t.thread_id
                   AND request.status = 'pending'
-                ORDER BY request.created_at DESC, request.runtime_request_id DESC
+                ORDER BY CASE WHEN json_extract(request.payload_json, '$.responseCapability.type') = 'message'
+                  THEN 1 ELSE 0 END, request.created_at DESC, request.runtime_request_id DESC
                 LIMIT 1
               ) AS pending_request_payload_json,
               (
@@ -5632,14 +5648,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           pendingTurnItemsByThreadId,
         } = input;
         const thread = yield* decodeThreadPayload(row.payload_json);
+        const pendingRequest =
+          row.pending_request_payload_json === null
+            ? null
+            : yield* decodeRuntimeRequestPayload(row.pending_request_payload_json);
+        const pendingSecret =
+          row.pending_secret_request_payload_json === null
+            ? null
+            : secretRequestAsPendingInput(
+                yield* decodeTurnItemPayload(row.pending_secret_request_payload_json),
+              );
         const pendingRuntimeRequest =
-          row.pending_request_payload_json !== null
-            ? yield* decodeRuntimeRequestPayload(row.pending_request_payload_json)
-            : row.pending_secret_request_payload_json !== null
-              ? secretRequestAsPendingInput(
-                  yield* decodeTurnItemPayload(row.pending_secret_request_payload_json),
-                )
-              : null;
+          [pendingRequest, pendingSecret]
+            .filter((request) => request !== null)
+            .toSorted(comparePendingRuntimeRequests)[0] ?? null;
         let terminalFailureItem =
           row.terminal_failure_payload_json === null
             ? null
