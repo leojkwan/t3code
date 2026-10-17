@@ -26,6 +26,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -1910,6 +1911,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     onEvent: (event: ProviderAdapterV2Event) => Effect.Effect<unknown> = () => Effect.void,
     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
+    onRuntimeRequestFinished: (method: string, payload: unknown) => Effect.Effect<void> = () =>
+      Effect.void,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1936,6 +1939,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   (client) =>
                     ({
                       ...client,
+                      handleServerRequest: (method, handler) =>
+                        client.handleServerRequest(method, (payload) =>
+                          handler(payload).pipe(
+                            Effect.ensuring(onRuntimeRequestFinished(method, payload)),
+                          ),
+                        ),
                       request: (method, params) =>
                         onRequest(method, params).pipe(
                           Effect.andThen(client.request(method, params)),
@@ -2231,6 +2240,200 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       const cause = error._tag === "ProviderAdapterProtocolError" ? error.cause : undefined;
       assert.equal((cause as { _tag?: string } | undefined)?._tag, "CodexAppServerRequestError");
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect.each([false, true] as const)(
+    "joins a stopped turn's pending runtime request and refuses its late answer (native interrupt fails: %s)",
+    (interruptFails) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "pending-stop-thread";
+        const nativeTurnId = "pending-stop-turn";
+        const otherThreadId = "pending-other-thread";
+        const otherTurnId = "pending-other-turn";
+        const otherPrompt = "Continue the unrelated task.";
+        const question = (threadId: string, turnId: string, itemId: string, id: number) => ({
+          type: "emit_inbound" as const,
+          label: itemId,
+          frame: {
+            id,
+            method: "item/tool/requestUserInput",
+            params: {
+              threadId,
+              turnId,
+              itemId,
+              isBlocking: true,
+              questions: [{ id: "answer", header: "Choice", question: "Which option?" }],
+            },
+          },
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "pending-runtime-request-stop",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Wait for my choice." }),
+            question(nativeThreadId, nativeTurnId, "stopped-question", 90),
+            ...codexReplayPreamble({
+              nativeThreadId: otherThreadId,
+              nativeTurnId: otherTurnId,
+              prompt: otherPrompt,
+            })
+              .slice(3)
+              .map((entry) =>
+                entry.type !== "runtime_exit" && entry.label === "thread/start"
+                  ? withReplayRequestId(entry, 4)
+                  : entry.type !== "runtime_exit" && entry.label === "turn/start"
+                    ? withReplayRequestId(entry, 5)
+                    : entry,
+              ),
+            question(otherThreadId, otherTurnId, "other-question", 91),
+            {
+              type: "expect_outbound",
+              label: "turn/interrupt",
+              frame: {
+                id: 6,
+                method: "turn/interrupt",
+                params: { threadId: nativeThreadId, turnId: nativeTurnId },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "turn/interrupt",
+              frame: interruptFails
+                ? { id: 6, error: { code: -32_000, message: "native interrupt request failed" } }
+                : { id: 6, result: {} },
+            },
+            ...(interruptFails
+              ? []
+              : [
+                  {
+                    type: "emit_inbound" as const,
+                    label: "turn/completed",
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "interrupted" }),
+                      },
+                    },
+                  },
+                ]),
+            {
+              type: "expect_outbound",
+              label: "unrelated-question-answer",
+              frame: { id: 91, result: { answers: { answer: { answers: ["keep"] } } } },
+            },
+          ],
+        });
+        const stoppedRequest = yield* Deferred.make<RuntimeRequestId>();
+        const otherRequest = yield* Deferred.make<RuntimeRequestId>();
+        const otherFinished = yield* Deferred.make<void>();
+        const finished: Array<string> = [];
+        const starts: Array<string> = [];
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          (event) => {
+            if (event.type !== "runtime_request.updated") return Effect.void;
+            const request = event.runtimeRequest;
+            if (request.nativeRequestRef?.nativeId === "stopped-question") {
+              return Deferred.succeed(stoppedRequest, request.id);
+            }
+            if (request.nativeRequestRef?.nativeId === "other-question") {
+              return Deferred.succeed(otherRequest, request.id);
+            }
+            return Effect.void;
+          },
+          (method, params) =>
+            Effect.sync(() => {
+              if (
+                method === "turn/start" &&
+                Predicate.isObject(params) &&
+                typeof params.threadId === "string"
+              ) {
+                starts.push(params.threadId);
+              }
+            }),
+          undefined,
+          (method, payload) => {
+            if (
+              method !== "item/tool/requestUserInput" ||
+              !Predicate.isObject(payload) ||
+              typeof payload.itemId !== "string"
+            )
+              return Effect.void;
+            const itemId = payload.itemId;
+            return Effect.sync(() => finished.push(itemId)).pipe(
+              Effect.andThen(
+                itemId === "other-question"
+                  ? Deferred.succeed(otherFinished, undefined).pipe(Effect.asVoid)
+                  : Effect.void,
+              ),
+              Effect.asVoid,
+            );
+          },
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("pending-stop-attempt"),
+            text: "Wait for my choice.",
+          }),
+        );
+        const stoppedId = yield* Deferred.await(stoppedRequest);
+        const otherAppThreadId = ThreadId.make("thread-pending-other");
+        const otherProviderThread = yield* harness.runtime.ensureThread({
+          threadId: otherAppThreadId,
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        });
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: otherAppThreadId,
+            providerThread: otherProviderThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("pending-other-attempt"),
+            text: otherPrompt,
+          }),
+        );
+        const otherId = yield* Deferred.await(otherRequest);
+        assert.deepEqual(finished, []);
+        const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeTurnId,
+        });
+        const interruptResult = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId,
+          })
+          .pipe(Effect.exit);
+        assert.equal(interruptResult._tag, interruptFails ? "Failure" : "Success");
+        assert.deepEqual(
+          finished,
+          ["stopped-question"],
+          "Stop must join the target handler even when native interrupt fails",
+        );
+        const late = yield* harness.runtime
+          .respondToRuntimeRequest({
+            requestId: stoppedId,
+            answers: { answer: "late" },
+          })
+          .pipe(Effect.flip);
+        assert.equal(late._tag, "ProviderAdapterRuntimeRequestResponseError");
+        assert.include(String(late.cause), "No pending Codex runtime request");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: otherId,
+          answers: { answer: "keep" },
+        });
+        yield* Deferred.await(otherFinished);
+        assert.deepEqual(finished, ["stopped-question", "other-question"]);
+        assert.deepEqual(
+          starts,
+          [nativeThreadId, otherThreadId],
+          "Stop/late answer must start no replacement turn",
+        );
+        assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
   it.effect("waits for native start before interrupting an acknowledged queued turn", () =>
