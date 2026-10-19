@@ -1,0 +1,969 @@
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index 9f63d8c568b670b75c0d352dbb4902d6df0722e4..7b2b4cbbd6c084dc39e93f3f41df011b20527ac4 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -28,6 +28,10 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
+     type: Schema.Literal("provider-runtime.continue"),
+     sourceRunId: RunId,
+   }),
++  Schema.Struct({
++    type: Schema.Literal("thread-goal.continue"),
++    sourceRunId: RunId,
++  }),
+   Schema.Struct({
+     type: Schema.Literal("provider-session.detach"),
+     providerSessionId: ProviderSessionId,
+@@ -107,6 +111,7 @@ export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.T
+ 
+ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
+   "provider-runtime.continue",
++  "thread-goal.continue",
+   "provider-session.detach",
+   "provider-thread.rollback",
+   "checkpoint.capture",
+diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
+index 149494739182fc771fee52d529c5d122a12217c9..a8e5187432a79e1c1a711dcd7c6ac1033d9db010 100644
+--- a/apps/server/src/orchestration-v2/EffectWorker.ts
++++ b/apps/server/src/orchestration-v2/EffectWorker.ts
+@@ -1,4 +1,4 @@
+-import { CommandId } from "@t3tools/contracts";
++import { CommandId, MessageId } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
+ import * as Context from "effect/Context";
+ import * as DateTime from "effect/DateTime";
+@@ -28,6 +28,13 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
+ import * as ThreadManagementService from "./ThreadManagementService.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+ import { continueRestartedRun } from "./RestartContinuation.ts";
++import {
++  defaultGoalStorePath,
++  goalContinuationMessageId,
++  planGoalContinuation,
++  readGoalStore,
++  updateThreadGoal,
++} from "./GoalCommand.ts";
+ 
+ export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
+   "OrchestrationEffectExecutionError",
+@@ -442,6 +449,82 @@ export const executorLayer: Layer.Layer<
+                   }),
+               ),
+             );
++          case "thread-goal.continue": {
++            const sourceRunId = effect.request.sourceRunId;
++            const effectId = effect.id;
++            const effectType = effect.request.type;
++            return Effect.gen(function* () {
++              const messageId = MessageId.make(goalContinuationMessageId(sourceRunId));
++              const projection = yield* threads.getThreadRecords(
++                effect.threadId,
++                ["messages", "runs", "turnItems"],
++                {
++                  messageIds: [messageId],
++                  turnItemTypes: ["assistant_message"],
++                  turnItemRunIds: [sourceRunId],
++                },
++              );
++              const source = projection.runs.find((run) => run.id === sourceRunId);
++              const storePath = defaultGoalStorePath();
++              const assistantItems = projection.turnItems.filter(
++                (item): item is Extract<typeof item, { readonly type: "assistant_message" }> =>
++                  item.type === "assistant_message",
++              );
++              const settled = assistantItems.filter((item) => !item.streaming);
++              const assistantText = (settled.length > 0 ? settled : assistantItems)
++                .map((item) => item.text)
++                .join("\n");
++              const plan = planGoalContinuation({
++                closed:
++                  projection.thread.archivedAt !== null || projection.thread.deletedAt !== null,
++                sourceStatus: source?.status,
++                continuationAlreadySent: projection.messages.some(
++                  (message) => message.id === messageId,
++                ),
++                laterRunExists:
++                  source !== undefined &&
++                  projection.runs.some((run) => run.ordinal > source.ordinal),
++                goal: readGoalStore(storePath).threads[effect.threadId],
++                runId: sourceRunId,
++                assistantText,
++                now: DateTime.formatIso(yield* DateTime.now),
++              });
++              if (plan.action === "retry") {
++                return yield* new OrchestrationEffectExecutionError({
++                  effectId,
++                  effectType,
++                  cause: "Goal continuation is waiting for checkpoint capture to finish.",
++                });
++              }
++              if (plan.action === "satisfy") {
++                updateThreadGoal(storePath, effect.threadId, plan.goal);
++                return;
++              }
++              if (plan.action === "skip" || source === undefined) return;
++              yield* threads.dispatch({
++                type: "message.dispatch",
++                commandId: CommandId.make(`command:goal-continuation:${sourceRunId}`),
++                threadId: effect.threadId,
++                messageId,
++                text: plan.text,
++                attachments: [],
++                modelSelection: source.modelSelection,
++                dispatchMode: { type: "start_immediately" },
++                createdBy: "agent",
++                creationSource: "server",
++              });
++              updateThreadGoal(storePath, effect.threadId, plan.goal);
++            }).pipe(
++              Effect.mapError(
++                (cause) =>
++                  new OrchestrationEffectExecutionError({
++                    effectId,
++                    effectType,
++                    cause,
++                  }),
++              ),
++            );
++          }
+           case "thread-title.generate":
+             return threadTitleRegeneration
+               .execute({
+diff --git a/apps/server/src/orchestration-v2/GoalCommand.test.ts b/apps/server/src/orchestration-v2/GoalCommand.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b49d8c7e835bd22f0a1c374244cc47e188a7ad4
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/GoalCommand.test.ts
+@@ -0,0 +1,261 @@
++// @effect-diagnostics nodeBuiltinImport:off - The store round-trip uses a temporary directory.
++import * as NodeFS from "node:fs";
++import * as NodeOS from "node:os";
++import * as NodePath from "node:path";
++import { describe, expect, it } from "@effect/vitest";
++
++import {
++  applyGoalCommand,
++  decideContinuation,
++  goalContinuationRequested,
++  goalProviderText,
++  parseGoalCommand,
++  persistentGoalMenu,
++  planGoalContinuation,
++  readGoalStore,
++  threadGoalContinueEffectId,
++  updateThreadGoal,
++  withGoalSlashCommand,
++} from "./GoalCommand.ts";
++
++describe("goal commands", () => {
++  it("advertises the persistent loop only for GLM identities", () => {
++    expect(persistentGoalMenu({ agentId: "glm-acp-agent" })).toBe(true);
++    expect(persistentGoalMenu({ instanceId: "acpRegistry_glm_agent" })).toBe(true);
++    expect(persistentGoalMenu({ displayName: "GLM (Z Code plan)" })).toBe(true);
++    expect(persistentGoalMenu({ agentId: "test-agent", instanceId: "acpRegistry_test" })).toBe(
++      false,
++    );
++  });
++
++  it("parses set, read, pause, resume, and clear", () => {
++    expect(parseGoalCommand("hello")).toBeNull();
++    expect(parseGoalCommand("  /goal  ")).toEqual({ type: "read" });
++    expect(parseGoalCommand("/goal pause")).toEqual({ type: "pause" });
++    expect(parseGoalCommand("/GOAL resume")).toEqual({ type: "resume" });
++    expect(parseGoalCommand("/goal clear")).toEqual({ type: "clear" });
++    expect(parseGoalCommand("/goal ship the fix")).toEqual({
++      type: "set",
++      objective: "ship the fix",
++    });
++  });
++
++  it("keeps the provider prompt from looking like a native slash command", () => {
++    const set = applyGoalCommand(undefined, { type: "set", objective: "ship the fix" }, "t0");
++    expect(set.startProvider).toBe(true);
++    expect(set.providerText?.startsWith("/")).toBe(false);
++    expect(set.providerText).toContain("ship the fix");
++    expect(set.providerText).toContain("GOAL_SATISFIED");
++    expect(goalProviderText("ship the fix").startsWith("/")).toBe(false);
++  });
++
++  it("reads, pauses, resumes, and clears without starting a provider turn", () => {
++    const set = applyGoalCommand(undefined, { type: "set", objective: "ship the fix" }, "t0");
++    expect(applyGoalCommand(set.goal, { type: "read" }, "t1")).toMatchObject({
++      startProvider: false,
++      reply: "Goal is active: ship the fix",
++    });
++    const paused = applyGoalCommand(set.goal, { type: "pause" }, "t2");
++    expect(paused.goal?.status).toBe("paused");
++    expect(paused.startProvider).toBe(false);
++    const resumed = applyGoalCommand(paused.goal, { type: "resume" }, "t3");
++    expect(resumed.goal?.status).toBe("active");
++    const cleared = applyGoalCommand(resumed.goal, { type: "clear" }, "t4");
++    expect(cleared.goal).toBeUndefined();
++    expect(cleared.reply).toBe("Goal cleared.");
++    expect(applyGoalCommand(undefined, { type: "pause" }, "t5").reply).toBe(
++      "No active goal to pause.",
++    );
++  });
++
++  it("continues once per run, stops when paused or satisfied, and does not double-continue", () => {
++    const active = applyGoalCommand(
++      undefined,
++      { type: "set", objective: "ship the fix" },
++      "t0",
++    ).goal;
++    const first = decideContinuation({
++      goal: active,
++      runId: "run-1",
++      assistantText: "still working",
++      now: "t1",
++    });
++    expect(first.action).toBe("continue");
++    if (first.action !== "continue") return;
++    expect(first.text.startsWith("/")).toBe(false);
++    expect(first.goal.lastContinuedRunId).toBe("run-1");
++
++    const duplicate = decideContinuation({
++      goal: first.goal,
++      runId: "run-1",
++      assistantText: "still working",
++      now: "t2",
++    });
++    expect(duplicate).toMatchObject({ action: "stop", reason: "already-continued" });
++
++    const paused = applyGoalCommand(active, { type: "pause" }, "t3").goal;
++    expect(
++      decideContinuation({
++        goal: paused,
++        runId: "run-2",
++        assistantText: "done?",
++        now: "t4",
++      }),
++    ).toMatchObject({ action: "stop", reason: "paused" });
++
++    const satisfied = decideContinuation({
++      goal: active,
++      runId: "run-2",
++      assistantText: "verified\nGOAL_SATISFIED\n",
++      now: "t5",
++    });
++    expect(satisfied).toMatchObject({ action: "stop", reason: "satisfied" });
++    if (satisfied.action === "stop") expect(satisfied.goal?.status).toBe("satisfied");
++  });
++
++  it("admits one continuation and refuses a second send", () => {
++    const active = applyGoalCommand(
++      undefined,
++      { type: "set", objective: "ship the fix" },
++      "t0",
++    ).goal;
++    const base = {
++      closed: false,
++      sourceStatus: "completed",
++      continuationAlreadySent: false,
++      laterRunExists: false,
++      goal: active,
++      runId: "run-1",
++      assistantText: "still working",
++      now: "t1",
++    };
++    const admitted = planGoalContinuation(base);
++    expect(admitted.action).toBe("dispatch");
++    if (admitted.action !== "dispatch") return;
++    expect(admitted.text.startsWith("/")).toBe(false);
++    expect(admitted.text).toContain("ship the fix");
++    expect(admitted.goal.lastContinuedRunId).toBe("run-1");
++
++    expect(planGoalContinuation({ ...base, goal: admitted.goal, now: "t2" })).toMatchObject({
++      action: "skip",
++    });
++    expect(planGoalContinuation({ ...base, continuationAlreadySent: true })).toMatchObject({
++      action: "skip",
++    });
++    expect(planGoalContinuation({ ...base, laterRunExists: true })).toMatchObject({
++      action: "skip",
++    });
++    expect(planGoalContinuation({ ...base, closed: true })).toMatchObject({ action: "skip" });
++    expect(planGoalContinuation({ ...base, sourceStatus: "failed" })).toMatchObject({
++      action: "skip",
++    });
++    expect(planGoalContinuation({ ...base, sourceStatus: "waiting" })).toMatchObject({
++      action: "retry",
++    });
++    expect(planGoalContinuation({ ...base, assistantText: "done\nGOAL_SATISFIED" })).toMatchObject({
++      action: "satisfy",
++      goal: { status: "satisfied" },
++    });
++    expect(planGoalContinuation({ ...base, goal: undefined })).toMatchObject({ action: "skip" });
++
++    expect(goalContinuationRequested("completed", "active")).toBe(true);
++    expect(goalContinuationRequested("completed", "paused")).toBe(false);
++    expect(goalContinuationRequested("interrupted", "active")).toBe(false);
++    expect(goalContinuationRequested("completed", undefined)).toBe(false);
++    const runId = "run-1";
++    expect(`effect:checkpoint.capture:${runId}` < threadGoalContinueEffectId(runId)).toBe(true);
++  });
++
++  it("round-trips a goal store and advertises the command once", () => {
++    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-goal-store-"));
++    const path = NodePath.join(dir, "nested", "thread-goals.json");
++    const goal = applyGoalCommand(undefined, { type: "set", objective: "ship the fix" }, "t0").goal;
++    updateThreadGoal(path, "thread-1", goal);
++    expect(readGoalStore(path).threads["thread-1"]?.objective).toBe("ship the fix");
++    updateThreadGoal(path, "thread-1", undefined);
++    expect(readGoalStore(path).threads["thread-1"]).toBeUndefined();
++    expect(withGoalSlashCommand([{ name: "compact" }]).map((command) => command.name)).toEqual([
++      "goal",
++      "compact",
++    ]);
++    expect(withGoalSlashCommand([{ name: "goal" }])).toEqual([{ name: "goal" }]);
++  });
++
++  it("keeps one Codex thread goal from slash text and continues a completed run once", () => {
++    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-goal-codex-"));
++    const path = NodePath.join(dir, "thread-goals.json");
++    const threadId = "thread-codex";
++    const command = (text: string) => {
++      const parsed = parseGoalCommand(text);
++      if (parsed === null) throw new Error(`expected a goal command: ${text}`);
++      return parsed;
++    };
++    const set = applyGoalCommand(undefined, command("/goal ship the fix"), "t0");
++    expect(set.startProvider).toBe(true);
++    expect(set.providerText?.startsWith("/")).toBe(false);
++    expect(set.providerText).not.toContain("/goal");
++    expect(set.goal?.status).toBe("active");
++    updateThreadGoal(path, threadId, set.goal);
++    expect(readGoalStore(path).threads[threadId]).toMatchObject({
++      objective: "ship the fix",
++      status: "active",
++    });
++    expect(Object.keys(readGoalStore(path).threads)).toEqual([threadId]);
++
++    const stored = () => readGoalStore(path).threads[threadId];
++    const read = applyGoalCommand(stored(), command("/goal"), "t1");
++    expect(read.startProvider).toBe(false);
++    expect(read.reply).toBe("Goal is active: ship the fix");
++    expect(read.goal).toEqual(stored());
++
++    const paused = applyGoalCommand(stored(), command("/goal pause"), "t2");
++    expect(paused.startProvider).toBe(false);
++    expect(paused.goal?.status).toBe("paused");
++    updateThreadGoal(path, threadId, paused.goal);
++    const base = {
++      closed: false,
++      sourceStatus: "completed",
++      continuationAlreadySent: false,
++      laterRunExists: false,
++      runId: "run-1",
++      assistantText: "still working",
++      now: "t3",
++    };
++    expect(planGoalContinuation({ ...base, goal: stored() })).toMatchObject({ action: "skip" });
++
++    const resumed = applyGoalCommand(stored(), command("/goal resume"), "t4");
++    expect(resumed.startProvider).toBe(false);
++    expect(resumed.goal?.status).toBe("active");
++    updateThreadGoal(path, threadId, resumed.goal);
++    const admitted = planGoalContinuation({ ...base, goal: stored(), now: "t5" });
++    expect(admitted.action).toBe("dispatch");
++    if (admitted.action !== "dispatch") return;
++    expect(admitted.text.startsWith("/")).toBe(false);
++    expect(admitted.text).toContain("ship the fix");
++    updateThreadGoal(path, threadId, admitted.goal);
++    expect(planGoalContinuation({ ...base, goal: stored(), now: "t6" })).toMatchObject({
++      action: "skip",
++    });
++    expect(
++      planGoalContinuation({ ...base, goal: stored(), sourceStatus: "failed", now: "t7" }),
++    ).toMatchObject({ action: "skip" });
++    expect(
++      planGoalContinuation({
++        ...base,
++        goal: applyGoalCommand(undefined, command("/goal ship the fix"), "t0").goal,
++        runId: "run-2",
++        assistantText: "GOAL_SATISFIED",
++        now: "t8",
++      }),
++    ).toMatchObject({ action: "satisfy", goal: { status: "satisfied" } });
++
++    const cleared = applyGoalCommand(stored(), command("/goal clear"), "t9");
++    expect(cleared.startProvider).toBe(false);
++    expect(cleared.goal).toBeUndefined();
++    updateThreadGoal(path, threadId, cleared.goal);
++    expect(stored()).toBeUndefined();
++    expect(planGoalContinuation({ ...base, goal: undefined, now: "t10" })).toMatchObject({
++      action: "skip",
++    });
++  });
++});
+diff --git a/apps/server/src/orchestration-v2/GoalCommand.ts b/apps/server/src/orchestration-v2/GoalCommand.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..53f86b2727f0bb5044783a78da900dc3beaf8f28
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/GoalCommand.ts
+@@ -0,0 +1,284 @@
++// @effect-diagnostics nodeBuiltinImport:off - Thread goals are one local JSON file. Reading it stays synchronous so turn start and turn finalization do not grow a service requirement.
++import * as NodeFS from "node:fs";
++import * as NodeOS from "node:os";
++import * as NodePath from "node:path";
++
++import type { ServerProviderSlashCommand } from "@t3tools/contracts";
++
++export const GOAL_SLASH_COMMAND = {
++  name: "goal",
++  description: "Set, read, pause, resume, or clear this thread's goal",
++  input: { hint: "objective, pause, resume, or clear" },
++} satisfies ServerProviderSlashCommand;
++
++export const GOAL_SATISFIED_LINE = "GOAL_SATISFIED";
++
++export type GoalStatus = "active" | "paused" | "satisfied";
++
++export interface ThreadGoal {
++  readonly objective: string;
++  readonly status: GoalStatus;
++  readonly updatedAt: string;
++  readonly lastContinuedRunId?: string;
++}
++
++export interface GoalStore {
++  readonly version: 1;
++  readonly threads: Readonly<Record<string, ThreadGoal>>;
++}
++
++export type GoalCommand =
++  | { readonly type: "read" }
++  | { readonly type: "pause" }
++  | { readonly type: "resume" }
++  | { readonly type: "clear" }
++  | { readonly type: "set"; readonly objective: string };
++
++export interface GoalCommandResult {
++  readonly goal: ThreadGoal | undefined;
++  readonly reply: string;
++  /** True only for set: the provider should run the objective, not the slash text. */
++  readonly startProvider: boolean;
++  readonly providerText?: string;
++}
++
++export type ContinuationDecision =
++  | { readonly action: "continue"; readonly goal: ThreadGoal; readonly text: string }
++  | {
++      readonly action: "stop";
++      readonly goal: ThreadGoal | undefined;
++      readonly reason: "none" | "paused" | "satisfied" | "already-continued";
++    };
++
++const EMPTY_STORE: GoalStore = { version: 1, threads: {} };
++
++export function defaultGoalStorePath(home: string = NodeOS.homedir()): string {
++  return NodePath.join(home, ".t3", "userdata", "thread-goals.json");
++}
++
++export function parseGoalCommand(text: string): GoalCommand | null {
++  const match = /^\/goal(?:\s+([\s\S]*))?$/i.exec(text.trim());
++  if (match === null) return null;
++  const rest = (match[1] ?? "").trim();
++  if (rest.length === 0) return { type: "read" };
++  const verb = rest.toLowerCase();
++  if (verb === "pause") return { type: "pause" };
++  if (verb === "resume") return { type: "resume" };
++  if (verb === "clear") return { type: "clear" };
++  return { type: "set", objective: rest };
++}
++
++export const GOAL_STOP_INSTRUCTION = `When that end state is met, end with a line that is exactly ${GOAL_SATISFIED_LINE}.`;
++
++export function goalProviderText(objective: string): string {
++  return `${objective}\n\n${GOAL_STOP_INSTRUCTION}`;
++}
++
++export function goalContinuationMessageId(runId: string): string {
++  return `message:goal-continuation:${runId}`;
++}
++
++/** GLM is the only ACP agent whose menu advertises the shared T3 goal loop. */
++export function persistentGoalMenu(input: {
++  readonly agentId?: string | undefined;
++  readonly instanceId?: string | undefined;
++  readonly displayName?: string | undefined;
++}): boolean {
++  return [input.agentId, input.instanceId, input.displayName].some((value) =>
++    value?.toLowerCase().includes("glm"),
++  );
++}
++
++function describeGoal(goal: ThreadGoal | undefined): string {
++  if (goal === undefined) return "No goal is set.";
++  return `Goal is ${goal.status}: ${goal.objective}`;
++}
++
++export function applyGoalCommand(
++  current: ThreadGoal | undefined,
++  command: GoalCommand,
++  now: string,
++): GoalCommandResult {
++  switch (command.type) {
++    case "read":
++      return { goal: current, reply: describeGoal(current), startProvider: false };
++    case "clear":
++      return { goal: undefined, reply: "Goal cleared.", startProvider: false };
++    case "pause":
++      if (current === undefined || current.status !== "active") {
++        return {
++          goal: current,
++          reply: "No active goal to pause.",
++          startProvider: false,
++        };
++      }
++      return {
++        goal: { ...current, status: "paused", updatedAt: now },
++        reply: "Goal paused.",
++        startProvider: false,
++      };
++    case "resume":
++      if (current === undefined || current.status !== "paused") {
++        return {
++          goal: current,
++          reply: "No paused goal to resume.",
++          startProvider: false,
++        };
++      }
++      return {
++        goal: { ...current, status: "active", updatedAt: now },
++        reply: "Goal resumed.",
++        startProvider: false,
++      };
++    case "set": {
++      const goal: ThreadGoal = {
++        objective: command.objective,
++        status: "active",
++        updatedAt: now,
++      };
++      return {
++        goal,
++        reply: `Goal set: ${command.objective}`,
++        startProvider: true,
++        providerText: goalProviderText(command.objective),
++      };
++    }
++  }
++}
++
++export function assistantSatisfiedGoal(text: string): boolean {
++  return text.split(/\r?\n/).some((line) => line.trim() === GOAL_SATISFIED_LINE);
++}
++
++export function decideContinuation(input: {
++  readonly goal: ThreadGoal | undefined;
++  readonly runId: string;
++  readonly assistantText: string;
++  readonly now: string;
++}): ContinuationDecision {
++  const goal = input.goal;
++  if (goal === undefined) return { action: "stop", goal: undefined, reason: "none" };
++  if (goal.status === "paused") return { action: "stop", goal, reason: "paused" };
++  if (goal.status === "satisfied" || assistantSatisfiedGoal(input.assistantText)) {
++    return {
++      action: "stop",
++      goal: { ...goal, status: "satisfied", updatedAt: input.now },
++      reason: "satisfied",
++    };
++  }
++  if (goal.lastContinuedRunId === input.runId) {
++    return { action: "stop", goal, reason: "already-continued" };
++  }
++  const continued: ThreadGoal = {
++    ...goal,
++    updatedAt: input.now,
++    lastContinuedRunId: input.runId,
++  };
++  return {
++    action: "continue",
++    goal: continued,
++    text: `Continue the active goal until its verifiable end state is met.\n\n${goal.objective}\n\n${GOAL_STOP_INSTRUCTION}`,
++  };
++}
++
++const CLOSED_SOURCE_STATUSES = new Set(["failed", "cancelled", "interrupted", "rolled_back"]);
++
++export type GoalContinuationPlan =
++  | { readonly action: "retry" }
++  | { readonly action: "skip" }
++  | { readonly action: "satisfy"; readonly goal: ThreadGoal }
++  | { readonly action: "dispatch"; readonly text: string; readonly goal: ThreadGoal };
++
++/**
++ * One admission decision for a finished run. Dispatch is the only action that
++ * starts another turn, and it stamps the source run so a replay cannot send twice.
++ */
++export function planGoalContinuation(input: {
++  readonly closed: boolean;
++  readonly sourceStatus: string | undefined;
++  readonly continuationAlreadySent: boolean;
++  readonly laterRunExists: boolean;
++  readonly goal: ThreadGoal | undefined;
++  readonly runId: string;
++  readonly assistantText: string;
++  readonly now: string;
++}): GoalContinuationPlan {
++  if (
++    input.closed ||
++    input.sourceStatus === undefined ||
++    CLOSED_SOURCE_STATUSES.has(input.sourceStatus)
++  ) {
++    return { action: "skip" };
++  }
++  if (input.sourceStatus !== "completed") return { action: "retry" };
++  if (input.continuationAlreadySent || input.laterRunExists) return { action: "skip" };
++  const decision = decideContinuation({
++    goal: input.goal,
++    runId: input.runId,
++    assistantText: input.assistantText,
++    now: input.now,
++  });
++  if (decision.action === "stop") {
++    if (decision.reason === "satisfied" && decision.goal !== undefined) {
++      return { action: "satisfy", goal: decision.goal };
++    }
++    return { action: "skip" };
++  }
++  if (decision.text.startsWith("/")) return { action: "skip" };
++  return { action: "dispatch", text: decision.text, goal: decision.goal };
++}
++
++export function goalContinuationRequested(
++  terminalStatus: string,
++  goalStatus: GoalStatus | undefined,
++): boolean {
++  return terminalStatus === "completed" && goalStatus === "active";
++}
++
++export function threadGoalContinueEffectId(runId: string): string {
++  return `effect:thread-goal.continue:${runId}`;
++}
++
++export function withGoalSlashCommand<T extends { readonly name: string }>(
++  commands: ReadonlyArray<T>,
++): ReadonlyArray<T | typeof GOAL_SLASH_COMMAND> {
++  if (commands.some((command) => command.name === "goal")) return commands;
++  return [GOAL_SLASH_COMMAND, ...commands];
++}
++
++export function readGoalStore(path: string): GoalStore {
++  try {
++    const parsed = JSON.parse(NodeFS.readFileSync(path, "utf8")) as Partial<GoalStore>;
++    if (
++      parsed.version !== 1 ||
++      parsed.threads === undefined ||
++      typeof parsed.threads !== "object"
++    ) {
++      return EMPTY_STORE;
++    }
++    return { version: 1, threads: parsed.threads };
++  } catch {
++    return EMPTY_STORE;
++  }
++}
++
++export function writeGoalStore(path: string, store: GoalStore): void {
++  NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
++  const temporary = `${path}.${process.pid}.tmp`;
++  NodeFS.writeFileSync(temporary, `${JSON.stringify(store)}\n`);
++  NodeFS.renameSync(temporary, path);
++}
++
++export function updateThreadGoal(
++  path: string,
++  threadId: string,
++  goal: ThreadGoal | undefined,
++): GoalStore {
++  const current = readGoalStore(path);
++  const threads = { ...current.threads };
++  if (goal === undefined) delete threads[threadId];
++  else threads[threadId] = goal;
++  const next: GoalStore = { version: 1, threads };
++  writeGoalStore(path, next);
++  return next;
++}
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+index a3e3b122ca45bd929d047748dafed260d74804fc..0958e3ffc8a037354bfa1cbf0a16e6a677539bdc 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+@@ -52,6 +52,13 @@ import {
+   pendingRestartCancelledBackgroundWork,
+   restartCancelledBackgroundWorkNote,
+ } from "./RestartBackgroundNote.ts";
++import {
++  applyGoalCommand,
++  defaultGoalStorePath,
++  parseGoalCommand,
++  readGoalStore,
++  updateThreadGoal,
++} from "./GoalCommand.ts";
+ 
+ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
+   "ProviderTurnStartError",
+@@ -368,6 +375,38 @@ export const layer: Layer.Layer<
+           });
+         },
+       );
++      const goalCommand = message.attachments.length === 0 ? parseGoalCommand(message.text) : null;
++      if (goalCommand !== null && goalCommand.type !== "set") {
++        const now = yield* DateTime.now;
++        const storePath = defaultGoalStorePath();
++        const result = applyGoalCommand(
++          readGoalStore(storePath).threads[projection.thread.id],
++          goalCommand,
++          DateTime.formatIso(now),
++        );
++        updateThreadGoal(storePath, projection.thread.id, result.goal);
++        yield* settleRunBeforeStart({
++          signal: `goal-${goalCommand.type}`,
++          status: "completed",
++          now,
++          startedAt: now,
++          providerInstanceId: run.providerInstanceId,
++          itemProviderThreadId: providerThread.id,
++          item: {
++            type: "command_execution",
++            title: "Goal",
++            input: message.text.trim(),
++            output: result.reply,
++            exitCode: 0,
++          },
++          providerThreadUpdate: {
++            ...providerThread,
++            status: providerThread.nativeThreadRef === null ? "not_loaded" : "idle",
++            updatedAt: now,
++          },
++        });
++        return;
++      }
+       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
+         const isEmptyCompaction =
+           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
+@@ -943,8 +982,19 @@ export const layer: Layer.Layer<
+       const routableSubagents = projection.subagents.filter((subagent) =>
+         RunExecutionService.canRouteRelatedSubagent(subagent.status),
+       );
++      let providerText = message.text;
++      if (goalCommand?.type === "set") {
++        const storePath = defaultGoalStorePath();
++        const result = applyGoalCommand(
++          readGoalStore(storePath).threads[projection.thread.id],
++          goalCommand,
++          DateTime.formatIso(yield* DateTime.now),
++        );
++        updateThreadGoal(storePath, projection.thread.id, result.goal);
++        if (result.providerText !== undefined) providerText = result.providerText;
++      }
+       const userText = projectComposerContextForProvider({
+-        text: message.text,
++        text: providerText,
+         records: message.context?.records ?? [],
+       });
+       // Delivered once: this run's provider turn marks the work as told. A
+diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
+index 6aff5da24f1e101ebed640de7bf0d657003290eb..87db2733e3572da831603b986ec1ef91f8ab97c4 100644
+--- a/apps/server/src/orchestration-v2/RunExecutionService.ts
++++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
+@@ -38,6 +38,12 @@ import * as Stream from "effect/Stream";
+ import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+ import * as CheckpointService from "./CheckpointService.ts";
++import {
++  defaultGoalStorePath,
++  goalContinuationRequested,
++  readGoalStore,
++  threadGoalContinueEffectId,
++} from "./GoalCommand.ts";
+ import * as EventSink from "./EventSink.ts";
+ import * as IdAllocator from "./IdAllocator.ts";
+ import type {
+@@ -661,14 +667,21 @@ export const layer: Layer.Layer<
+         const checkpointCaptureCommandId = CommandId.make(
+           `command:effect:checkpoint.capture:${input.run.id}`,
+         );
++        const captureCheckpoint =
++          input.terminal.status === "completed" ||
++          input.terminal.status === "interrupted" ||
++          input.terminal.status === "cancelled";
++        const continueGoal = goalContinuationRequested(
++          input.terminal.status,
++          readGoalStore(defaultGoalStorePath()).threads[input.run.threadId]?.status,
++        );
+         // Stopped runs capture too: their checkpoint is the rollback point for
+         // the next message. The capture is enqueued with these terminal events,
+-        // ahead of any later run's start on this thread's effect lane.
++        // ahead of any later run's start on this thread's effect lane. The goal
++        // effect is second, so the per-thread lane runs it after capture.
+         const finalization = {
+-          effects:
+-            input.terminal.status === "completed" ||
+-            input.terminal.status === "interrupted" ||
+-            input.terminal.status === "cancelled"
++          effects: [
++            ...(captureCheckpoint
+               ? [
+                   {
+                     id: `effect:checkpoint.capture:${input.run.id}`,
+@@ -681,7 +694,23 @@ export const layer: Layer.Layer<
+                     },
+                   },
+                 ]
+-              : [],
++              : []),
++            ...(continueGoal
++              ? [
++                  {
++                    id: threadGoalContinueEffectId(input.run.id),
++                    commandId: CommandId.make(
++                      `command:effect:thread-goal.continue:${input.run.id}`,
++                    ),
++                    threadId: input.run.threadId,
++                    request: {
++                      type: "thread-goal.continue" as const,
++                      sourceRunId: input.run.id,
++                    },
++                  },
++                ]
++              : []),
++          ],
+           events: [
+             // Terminalize open run-owned subagent rows before the root run
+             // settles so projections never keep a forever-running subagent card.
+diff --git a/apps/server/src/provider/Layers/CodexProvider.ts b/apps/server/src/provider/Layers/CodexProvider.ts
+index dcb606932ab9826ff0eda368c68e7a59b4306fcb..ebe3ddf2e2b88498a1c075617ccd89756128f55d 100644
+--- a/apps/server/src/provider/Layers/CodexProvider.ts
++++ b/apps/server/src/provider/Layers/CodexProvider.ts
+@@ -32,6 +32,7 @@ import {
+   readCustomModelEntries,
+ } from "@t3tools/shared/model";
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
++import { GOAL_SLASH_COMMAND } from "../../orchestration-v2/GoalCommand.ts";
+ import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+ import {
+   AUTH_PROBE_TIMEOUT_MS,
+@@ -691,6 +692,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+     skills: snapshot.skills,
+     slashCommands: [
+       COMPACT_SLASH_COMMAND,
++      GOAL_SLASH_COMMAND,
+       {
+         name: "feedback",
+         description: "Send this thread and Codex logs to OpenAI",
+diff --git a/apps/server/src/provider/Layers/ProviderRegistry.test.ts b/apps/server/src/provider/Layers/ProviderRegistry.test.ts
+index ee52a71bba5f5bfd817b91ff9eb00e3bfbaa7c65..3ebe6d1fb0df353af78f8454a1399d0c1952154d 100644
+--- a/apps/server/src/provider/Layers/ProviderRegistry.test.ts
++++ b/apps/server/src/provider/Layers/ProviderRegistry.test.ts
+@@ -37,6 +37,7 @@ import { deepMerge } from "@t3tools/shared/Struct";
+ import { createModelCapabilities } from "@t3tools/shared/model";
+ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+ 
++import { GOAL_SLASH_COMMAND } from "../../orchestration-v2/GoalCommand.ts";
+ import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
+ import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+@@ -446,6 +447,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
+             },
+           ]);
+           assert.deepStrictEqual(status.slashCommands.slice(1), [
++            GOAL_SLASH_COMMAND,
+             {
+               name: "feedback",
+               description: "Send this thread and Codex logs to OpenAI",
+diff --git a/apps/web/src/components/chat/composerSlashCommandSearch.test.ts b/apps/web/src/components/chat/composerSlashCommandSearch.test.ts
+index 350ceba3a457e342ef6992464b78808d7e5705f0..c093e4fc4158fe317b5a82acd685286f05f637e9 100644
+--- a/apps/web/src/components/chat/composerSlashCommandSearch.test.ts
++++ b/apps/web/src/components/chat/composerSlashCommandSearch.test.ts
+@@ -1,6 +1,9 @@
+ import { describe, expect, it } from "vite-plus/test";
++import { getProviderSlashCommandsForSlashMenu } from "@t3tools/client-runtime/providerSkills";
+ import { ProviderDriverKind } from "@t3tools/contracts";
+ 
++import { detectComposerTrigger } from "../../composer-logic";
++import { GOAL_SLASH_COMMAND } from "../../../../server/src/orchestration-v2/GoalCommand.ts";
+ import type { ComposerCommandItem } from "./ComposerCommandMenu";
+ import {
+   searchSlashCommandItems,
+@@ -220,4 +223,80 @@ describe("searchSlashCommandItems", () => {
+       "skill:claudeAgent:unslop",
+     ]);
+   });
++
++  it("ranks the Codex goal command ahead of unrelated skills for /goal", () => {
++    const codex = ProviderDriverKind.make("codex");
++    const skills = [
++      {
++        name: "strongyes-visuals",
++        displayName: "Strongyes Visuals",
++        path: "/skills/strongyes-visuals/SKILL.md",
++        enabled: true,
++        shortDescription: "Use when StrongYes needs visual direction for imagery",
++      },
++      {
++        name: "future-leo",
++        displayName: "Future Leo",
++        path: "/skills/future-leo/SKILL.md",
++        enabled: true,
++        shortDescription: "Use for private foresight when Leo asks to think ahead",
++      },
++      {
++        name: "hermes",
++        displayName: "Hermes",
++        path: "/skills/hermes/SKILL.md",
++        enabled: true,
++        shortDescription:
++          "Use for Leo's Hermes Agent questions and local operation: memory and goals",
++      },
++      {
++        name: "goaler",
++        displayName: "Goaler",
++        path: "/skills/goaler/SKILL.md",
++        enabled: true,
++        shortDescription: "An unrelated skill whose name only shares a prefix",
++      },
++    ];
++    const commands = getProviderSlashCommandsForSlashMenu([GOAL_SLASH_COMMAND], skills);
++    expect(commands.map((command) => command.name)).toEqual(["goal"]);
++
++    const commandItems = commands.map((command) => ({
++      id: `provider-slash-command:${codex}:${command.name}`,
++      type: "provider-slash-command" as const,
++      provider: codex,
++      command,
++      label: `/${command.name}`,
++      description: command.description ?? command.input?.hint ?? "Run provider command",
++    }));
++    const skillItems = skills.map((skill) => ({
++      id: `skill:${codex}:${skill.name}`,
++      type: "skill" as const,
++      provider: codex,
++      skill,
++      label: `/skill:${skill.name}`,
++      description: skill.shortDescription,
++    }));
++    const items = slashCommandItemsForPromptPosition([...commandItems, ...skillItems], true);
++    const trigger = detectComposerTrigger("/goal", "/goal".length);
++    expect(trigger).toMatchObject({ kind: "slash-command", query: "goal", rangeStart: 0 });
++    if (trigger?.kind !== "slash-command") return;
++
++    const results = searchSlashCommandItems(items, trigger.query);
++    expect(results[0]).toMatchObject({
++      type: "provider-slash-command",
++      command: GOAL_SLASH_COMMAND,
++    });
++    expect(results[0]?.type).toBe("provider-slash-command");
++    expect(searchSlashCommandItems(items, "/goal")[0]).toMatchObject({
++      type: "provider-slash-command",
++      command: { name: "goal" },
++    });
++
++    const skillsOnly = searchSlashCommandItems(
++      items.filter((item) => item.type === "skill"),
++      trigger.query,
++    );
++    expect(skillsOnly.every((item) => item.type === "skill")).toBe(true);
++    expect(skillsOnly.some((item) => item.type === "provider-slash-command")).toBe(false);
++  });
+ });

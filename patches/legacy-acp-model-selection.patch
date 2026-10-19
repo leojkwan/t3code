@@ -1,0 +1,411 @@
+diff --git a/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts
+index aac767f8c886ce701095a0e20e47df4bf28b83bc..5285b77b8f156c66794621cf55bfb9af0f79271e 100644
+--- a/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts
+@@ -6201,6 +6201,25 @@ export function makeAcpAdapterV2(
+               ) === true;
+             if (hasModelConfig) {
+               yield* runtime.setModel(requestedModel);
++            } else {
++              const models = startResult.sessionSetupResult.models;
++              if (startResult.initializeResult.protocolVersion !== 1 || models == null) {
++                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
++                  driver,
++                  detail: `ACP session cannot apply requested model ${requestedModel}`,
++                });
++              }
++              if (!models.availableModels.some((model) => model.modelId === requestedModel)) {
++                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
++                  driver,
++                  detail: `ACP session does not advertise requested model ${requestedModel}`,
++                });
++              }
++              // ACP v1 agents without a typed model option use the legacy RPC.
++              if (models.currentModelId !== requestedModel) {
++                yield* runtime.setSessionModel(requestedModel);
++              }
++              appliedModel = requestedModel;
+             }
+           }
+           // Same-runtime switches compare against this stored setup, so keep
+diff --git a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+index e822ea4efd4d773d9a103c377179d7c813c96ab7..6de5f5b3cbda4ccf7e2c4839f517e783e5cac8ef 100644
+--- a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+@@ -1,8 +1,21 @@
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { assert, describe, it } from "@effect/vitest";
+-import { ProviderInstanceId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
++import {
++  MessageId,
++  NodeId,
++  ProjectId,
++  ProviderInstanceId,
++  ProviderSessionId,
++  RunAttemptId,
++  RunId,
++  ThreadId,
++} from "@t3tools/contracts";
+ import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
+ import * as Deferred from "effect/Deferred";
++import * as Cause from "effect/Cause";
++import * as Exit from "effect/Exit";
++import * as DateTime from "effect/DateTime";
++import * as Stream from "effect/Stream";
+ import * as Effect from "effect/Effect";
+ import * as Crypto from "effect/Crypto";
+ import * as FileSystem from "effect/FileSystem";
+@@ -28,7 +41,11 @@ import {
+   makeAcpReplayCompletenessAssertion,
+   makeAcpReplayRuntime,
+ } from "./AcpAdapterV2.testkit.ts";
+-import { ProviderAdapterV2RuntimePolicy } from "../ProviderAdapter.ts";
++import {
++  ProviderAdapterOpenSessionError,
++  ProviderAdapterTurnStartError,
++  ProviderAdapterV2RuntimePolicy,
++} from "../ProviderAdapter.ts";
+ import { BUILT_IN_PROVIDER_ADAPTER_DRIVER_KINDS_V2 } from "../builtInProviderAdapterDrivers.ts";
+ import {
+   ACP_REGISTRY_PROVIDER,
+@@ -130,7 +147,10 @@ describe("AcpRegistryAdapterV2", () => {
+     });
+   });
+ 
+-  describe("the agent's own mode picker", () => {
++  describe("stored session selections", () => {
++    const isSelectionFailure = Schema.is(
++      Schema.Union([ProviderAdapterOpenSessionError, ProviderAdapterTurnStartError]),
++    );
+     type Frame = Record<string, unknown>;
+     const outbound = (method: string, params: unknown = "<any>"): Frame => ({
+       type: "expect_outbound",
+@@ -150,12 +170,15 @@ describe("AcpRegistryAdapterV2", () => {
+     });
+ 
+     // A scripted ACP v1 agent: initialize, session/new answered with `setup`,
+-    // then the frames T3 must send (and the agent's answers) to apply the
+-    // user's stored pick from the agent's mode picker.
+-    const openWithStoredModePick = Effect.fn("openWithStoredModePick")(function* (input: {
++    // then the exact frames T3 must send to apply the stored selection.
++    const openWithStoredPick = Effect.fn("openWithStoredPick")(function* (input: {
+       readonly setup: unknown;
+-      readonly modeFrames: ReadonlyArray<Frame>;
+-      readonly storedModePick: string;
++      readonly selectionFrames: ReadonlyArray<Frame>;
++      readonly storedModePick?: string;
++      readonly storedModelPick?: string;
++      readonly protocolVersion?: 1 | 2;
++      readonly failureDetail?: string;
++      readonly turnModels?: ReadonlyArray<string>;
+     }) {
+       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+       const fileSystem = yield* FileSystem.FileSystem;
+@@ -169,17 +192,17 @@ describe("AcpRegistryAdapterV2", () => {
+           provider: ACP_REGISTRY_PROVIDER,
+           protocol: "acp.ndjson-jsonrpc",
+           version: "1",
+-          scenario: "stored-mode-pick",
++          scenario: "stored-session-pick",
+           entries: [
+             outbound("initialize"),
+             answer("initialize", {
+-              protocolVersion: 1,
++              protocolVersion: input.protocolVersion ?? 1,
+               agentCapabilities: { loadSession: false },
+               authMethods: [{ id: "test", name: "Test" }],
+             }),
+             outbound("session/new"),
+             answer("session/new", { sessionId: "agent-session", ...(input.setup as object) }),
+-            ...input.modeFrames,
++            ...input.selectionFrames,
+           ] as never,
+         },
+         ACP_REGISTRY_PROVIDER,
+@@ -209,36 +232,260 @@ describe("AcpRegistryAdapterV2", () => {
+           fileSystem,
+         }),
+       });
+-      yield* adapter
+-        .openSession({
+-          threadId: ThreadId.make("thread-acp-registry-mode-pick"),
++      const threadId = ThreadId.make("thread-acp-registry-mode-pick");
++      const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
++        runtimeMode: "approval-required",
++        interactionMode: "default",
++        cwd: replayDir,
++      });
++      const opened = yield* Effect.gen(function* () {
++        const session = yield* adapter.openSession({
++          threadId,
+           providerSessionId: ProviderSessionId.make("provider-session-mode-pick"),
+           modelSelection: {
+             instanceId,
+-            model: "default",
+-            options: [{ id: ACP_SESSION_MODE_OPTION_ID, value: input.storedModePick }],
++            model: input.storedModelPick ?? "default",
++            ...(input.storedModePick === undefined
++              ? {}
++              : { options: [{ id: ACP_SESSION_MODE_OPTION_ID, value: input.storedModePick }] }),
+           },
+-          runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+-            runtimeMode: "approval-required",
+-            interactionMode: "default",
+-            cwd: replayDir,
+-          }),
+-        })
+-        .pipe(Effect.scoped);
++          runtimePolicy,
++        });
++        const providerThread = yield* session.ensureThread({
++          threadId,
++          modelSelection: { instanceId, model: input.storedModelPick ?? "default" },
++          runtimePolicy,
++        });
++        for (const [index, model] of (input.turnModels ?? []).entries()) {
++          const now = yield* DateTime.now;
++          const ordinal = index + 1;
++          const modelSelection = { instanceId, model };
++          yield* session.startTurn({
++            appThread: {
++              id: threadId,
++              createdBy: "user",
++              creationSource: "web",
++              projectId: ProjectId.make("project-model-pick"),
++              title: "Model selection",
++              providerInstanceId: instanceId,
++              modelSelection,
++              runtimeMode: "approval-required",
++              interactionMode: "default",
++              branch: null,
++              worktreePath: null,
++              activeProviderThreadId: providerThread.id,
++              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
++              forkedFrom: null,
++              createdAt: now,
++              updatedAt: now,
++              archivedAt: null,
++              settledOverride: null,
++              settledAt: null,
++              lastVisitedAt: null,
++              deletedAt: null,
++            },
++            threadId,
++            runId: RunId.make(`run-model-pick-${ordinal}`),
++            runOrdinal: ordinal,
++            providerTurnOrdinal: ordinal,
++            attemptId: RunAttemptId.make(`attempt-model-pick-${ordinal}`),
++            rootNodeId: NodeId.make(`node-model-pick-${ordinal}`),
++            providerThread,
++            message: {
++              createdBy: "user",
++              creationSource: "web",
++              messageId: MessageId.make(`message-model-pick-${ordinal}`),
++              text: "test prompt",
++              attachments: [],
++            },
++            modelSelection,
++            runtimePolicy,
++          });
++          const terminal = yield* session.events.pipe(
++            Stream.filter((event) => event.type === "turn.terminal"),
++            Stream.runHead,
++          );
++          assert.isTrue(Option.isSome(terminal));
++          if (Option.isSome(terminal)) assert.equal(terminal.value.status, "completed");
++        }
++      }).pipe(Effect.scoped, Effect.exit);
++      if (input.failureDetail === undefined) {
++        if (Exit.isFailure(opened)) return yield* Effect.failCause(opened.cause);
++      } else {
++        assert.isTrue(Exit.isFailure(opened), "unapplied model must fail before prompting");
++        if (Exit.isFailure(opened)) {
++          const error = Cause.squash(opened.cause);
++          if (!isSelectionFailure(error)) {
++            return assert.fail(`Unexpected selection failure: ${String(error)}`);
++          }
++          assert.equal(
++            error._tag,
++            input.turnModels === undefined
++              ? "ProviderAdapterOpenSessionError"
++              : "ProviderAdapterTurnStartError",
++          );
++          assert.include(String(error.cause), input.failureDetail);
++        }
++      }
+       // Closing the session stops the agent, which writes its replay status in
+       // the same tick as its last answer. The script must be consumed exactly.
+       yield* makeAcpReplayCompletenessAssertion(fileSystem, statusPath, transcript);
+     });
+ 
++    const requestedModel = "openai-codex:gpt-6.1-sol";
++    const legacyModels = {
++      currentModelId: "agent-default",
++      availableModels: ["agent-default", requestedModel].map((modelId) => ({
++        modelId,
++        name: modelId,
++      })),
++    };
++    const modelOption = (currentValue: string) => ({
++      id: "session-model",
++      name: "Model",
++      category: "model",
++      type: "select",
++      currentValue,
++      options: legacyModels.availableModels.map(({ modelId }) => ({
++        value: modelId,
++        name: modelId,
++      })),
++    });
++
++    it.effect("applies a legacy ACP v1 model selection with session/set_model", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels },
++        storedModelPick: requestedModel,
++        selectionFrames: [
++          outbound("session/set_model", { sessionId: "agent-session", modelId: requestedModel }),
++          answer("session/set_model", {}),
++        ],
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("prefers the typed model option when legacy models are also advertised", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels, configOptions: [modelOption("agent-default")] },
++        storedModelPick: requestedModel,
++        selectionFrames: [
++          outbound("session/set_config_option", {
++            sessionId: "agent-session",
++            configId: "session-model",
++            value: requestedModel,
++          }),
++          answer("session/set_config_option", { configOptions: [modelOption(requestedModel)] }),
++        ],
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("rejects a model absent from the legacy catalog before sending it to the agent", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels },
++        storedModelPick: "unavailable-model",
++        selectionFrames: [],
++        failureDetail: "does not advertise requested model unavailable-model",
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("surfaces an agent rejection of legacy model selection", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels },
++        storedModelPick: requestedModel,
++        selectionFrames: [
++          outbound("session/set_model", { sessionId: "agent-session", modelId: requestedModel }),
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "session/set_model",
++              error: { code: -32602, message: "Model selection refused" },
++            },
++          },
++        ],
++        failureDetail: "Model selection refused",
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("rejects an explicit model when the session has no model selection mechanism", () =>
++      openWithStoredPick({
++        setup: {},
++        storedModelPick: requestedModel,
++        selectionFrames: [],
++        failureDetail: `cannot apply requested model ${requestedModel}`,
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("does not send the removed legacy model method to an ACP v2 agent", () =>
++      openWithStoredPick({
++        protocolVersion: 2,
++        setup: { models: legacyModels },
++        storedModelPick: requestedModel,
++        selectionFrames: [],
++        failureDetail: `cannot apply requested model ${requestedModel}`,
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect.each(["", "auto", "default"])("keeps the agent default for the %j alias", (model) =>
++      openWithStoredPick({ setup: {}, storedModelPick: model, selectionFrames: [] }).pipe(
++        Effect.provide(testLayer),
++        Effect.scoped,
++      ),
++    );
++
++    it.effect("keeps an already selected legacy model without another setter request", () =>
++      openWithStoredPick({
++        setup: { models: { ...legacyModels, currentModelId: requestedModel } },
++        storedModelPick: requestedModel,
++        selectionFrames: [],
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("applies A to B to A switches in the same legacy session before each prompt", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels },
++        storedModelPick: "agent-default",
++        turnModels: [requestedModel, "agent-default"],
++        selectionFrames: [
++          outbound("session/set_model", { sessionId: "agent-session", modelId: requestedModel }),
++          answer("session/set_model", {}),
++          outbound("session/prompt"),
++          answer("session/prompt", { stopReason: "end_turn" }),
++          outbound("session/set_model", { sessionId: "agent-session", modelId: "agent-default" }),
++          answer("session/set_model", {}),
++          outbound("session/prompt"),
++          answer("session/prompt", { stopReason: "end_turn" }),
++        ],
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
++    it.effect("fails a turn when the agent refuses a legacy model switch without prompting", () =>
++      openWithStoredPick({
++        setup: { models: legacyModels },
++        turnModels: [requestedModel],
++        selectionFrames: [
++          outbound("session/set_model", { sessionId: "agent-session", modelId: requestedModel }),
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "session/set_model",
++              error: { code: -32602, message: "Model selection refused" },
++            },
++          },
++        ],
++        failureDetail: "Model selection refused",
++      }).pipe(Effect.provide(testLayer), Effect.scoped),
++    );
++
+     it.effect("switches an agent that only advertises modes with session/set_mode", () =>
+-      openWithStoredModePick({
++      openWithStoredPick({
+         setup: {
+           modes: {
+             currentModeId: "default",
+             availableModes: ["default", "autoEdit"].map((id) => ({ id, name: id })),
+           },
+         },
+-        modeFrames: [
++        selectionFrames: [
+           outbound("session/set_mode", { sessionId: "agent-session", modeId: "autoEdit" }),
+           answer("session/set_mode", {}),
+         ],
+@@ -247,9 +494,9 @@ describe("AcpRegistryAdapterV2", () => {
+     );
+ 
+     it.effect("switches a mode config option under its own id", () =>
+-      openWithStoredModePick({
++      openWithStoredPick({
+         setup: { configOptions: [permissionModeOption("ask")] },
+-        modeFrames: [
++        selectionFrames: [
+           outbound("session/set_config_option", {
+             sessionId: "agent-session",
+             configId: "permission-mode",
